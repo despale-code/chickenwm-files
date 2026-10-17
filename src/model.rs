@@ -48,7 +48,35 @@ pub struct Prefs {
     pub show_hidden: bool,
     pub show_preview: bool,
     pub show_extensions: bool,
+    /// Old separate "Pinned" list; folded into `favorites` on first run.
     pub pinned: Vec<PathBuf>,
+    /// The sidebar's Favorites, in order. `None` until first set up (then seeded with the
+    /// standard folders), so a user who removes everything keeps an empty list.
+    pub favorites: Option<Vec<Favorite>>,
+}
+
+/// A sidebar favorite: a folder, optionally shown under a name of the user's choosing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Favorite {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Favorite {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, name: None }
+    }
+
+    pub fn label(&self) -> String {
+        if let Some(n) = self.name.as_deref().filter(|n| !n.trim().is_empty()) {
+            return n.to_string();
+        }
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
 }
 
 impl Default for Prefs {
@@ -61,11 +89,66 @@ impl Default for Prefs {
             show_preview: true,
             show_extensions: true,
             pinned: Vec::new(),
+            favorites: None,
         }
     }
 }
 
 impl Prefs {
+    /// First run with Favorites: seed them with `defaults` plus anything previously pinned.
+    /// Returns true when the list was created (so it can be saved).
+    pub fn ensure_favorites(&mut self, defaults: Vec<Favorite>) -> bool {
+        if self.favorites.is_some() {
+            return false;
+        }
+        let mut list = defaults;
+        for p in std::mem::take(&mut self.pinned) {
+            if !list.iter().any(|f| f.path == p) {
+                list.push(Favorite::new(p));
+            }
+        }
+        self.favorites = Some(list);
+        true
+    }
+
+    pub fn favorites(&self) -> &[Favorite] {
+        self.favorites.as_deref().unwrap_or(&[])
+    }
+
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites().iter().any(|f| f.path == path)
+    }
+
+    pub fn add_favorite(&mut self, path: PathBuf) {
+        let list = self.favorites.get_or_insert_with(Vec::new);
+        if !list.iter().any(|f| f.path == path) {
+            list.push(Favorite::new(path));
+        }
+    }
+
+    pub fn remove_favorite(&mut self, path: &Path) {
+        if let Some(list) = self.favorites.as_mut() {
+            list.retain(|f| f.path != path);
+        }
+    }
+
+    /// Moves the favorite at `from` so it ends up before the item now at `to` (`to == len`
+    /// moves it to the end).
+    pub fn move_favorite(&mut self, from: usize, to: usize) {
+        let Some(list) = self.favorites.as_mut() else { return };
+        if from >= list.len() || to > list.len() || to == from || to == from + 1 {
+            return;
+        }
+        let item = list.remove(from);
+        let to = if to > from { to - 1 } else { to };
+        list.insert(to, item);
+    }
+
+    pub fn rename_favorite(&mut self, path: &Path, name: Option<String>) {
+        if let Some(f) = self.favorites.as_mut().and_then(|l| l.iter_mut().find(|f| f.path == path)) {
+            f.name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        }
+    }
     fn path() -> PathBuf {
         config_dir().join("files.json")
     }
@@ -566,6 +649,46 @@ pub fn text_preview(entry: &Entry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fav_paths(p: &Prefs) -> Vec<String> {
+        p.favorites().iter().map(|f| f.path.display().to_string()).collect()
+    }
+
+    #[test]
+    fn favorites_seed_once_and_absorb_old_pins() {
+        let mut p = Prefs { pinned: vec![PathBuf::from("B"), PathBuf::from("X")], ..Prefs::default() };
+        assert!(p.ensure_favorites(vec![Favorite::new("A".into()), Favorite::new("B".into())]));
+        assert_eq!(fav_paths(&p), ["A", "B", "X"]);
+        assert!(p.pinned.is_empty());
+        // An emptied list stays empty: it's the user's choice, not "not set up".
+        p.remove_favorite(Path::new("A"));
+        p.remove_favorite(Path::new("B"));
+        p.remove_favorite(Path::new("X"));
+        assert!(!p.ensure_favorites(vec![Favorite::new("A".into())]));
+        assert!(p.favorites().is_empty());
+    }
+
+    #[test]
+    fn favorites_reorder_rename_and_dedupe() {
+        let mut p = Prefs::default();
+        for n in ["A", "B", "C", "D"] {
+            p.add_favorite(n.into());
+        }
+        p.add_favorite("B".into());
+        assert_eq!(fav_paths(&p), ["A", "B", "C", "D"]);
+        p.move_favorite(0, 3); // A before D
+        assert_eq!(fav_paths(&p), ["B", "C", "A", "D"]);
+        p.move_favorite(3, 0); // D to the top
+        assert_eq!(fav_paths(&p), ["D", "B", "C", "A"]);
+        p.move_favorite(1, 4); // B to the end
+        assert_eq!(fav_paths(&p), ["D", "C", "A", "B"]);
+        p.move_favorite(2, 3); // no-op: already there
+        assert_eq!(fav_paths(&p), ["D", "C", "A", "B"]);
+        p.rename_favorite(Path::new("C"), Some("  Work ".into()));
+        assert_eq!(p.favorites()[1].label(), "Work");
+        p.rename_favorite(Path::new("C"), Some("   ".into()));
+        assert_eq!(p.favorites()[1].label(), "C");
+    }
 
     #[test]
     fn natural_order() {

@@ -9,7 +9,7 @@ mod preview;
 
 use crate::icons::IconCache;
 use crate::model::{
-    archive_stem, compress_zip, extract_archive, format_bytes, format_time, is_archive, read_directory,
+    archive_stem, compress_zip, extract_archive, format_bytes, format_time, is_archive, read_directory, Favorite,
     text_preview, unique_path, Entry, Pane, Prefs, SortKey, ViewMode,
 };
 use crate::shell::{self, FileOp};
@@ -67,8 +67,14 @@ enum Action {
     Compress(Vec<PathBuf>),
     Shortcut(Vec<PathBuf>),
     Terminal(PathBuf),
+    /// Add a folder to the sidebar's Favorites.
     Pin(PathBuf),
+    /// Remove it from Favorites.
     Unpin(PathBuf),
+    MoveFavorite { from: usize, to: usize },
+    /// `None` restores the folder's own name.
+    RenameFavorite { path: PathBuf, name: Option<String> },
+    ResetFavorites,
     Transfer { sources: Vec<PathBuf>, dest: PathBuf, kind: DropKind },
     Sort(SortKey),
     SortDesc(bool),
@@ -263,6 +269,8 @@ pub struct FilesApp {
     focus: Side,
     prefs: Prefs,
     css: Arc<RwLock<CssStyleSheet>>,
+    /// Keeps the UI font in step with `--font-family` in files.css.
+    font: chickenwm_core::fonts::EguiFont,
     theme: Option<Theme>,
     target_fps: u32,
     icons: IconCache,
@@ -297,6 +305,12 @@ pub struct FilesApp {
     /// This app's light/dark choice in the master theme provider (`app_modes = files:…`).
     app_mode: chickenwm_core::theme::AppMode,
     _config_watcher: Option<notify::RecommendedWatcher>,
+    /// Favorite being dragged to a new place in the sidebar (its index).
+    fav_drag: Option<usize>,
+    /// Favorite being renamed inline: (folder, text, focus requested yet).
+    fav_rename: Option<(PathBuf, String, bool)>,
+    /// Sidebar sections the user folded away.
+    sidebar_collapsed: std::collections::HashSet<&'static str>,
 }
 
 fn hwnd_of(frame: &eframe::Frame) -> Option<HWND> {
@@ -354,6 +368,18 @@ fn quick_access() -> Vec<(String, PathBuf)> {
     v
 }
 
+/// The standard folders as Favorites, keeping names that differ from the folder's own
+/// (`Home`, `ChickenWM config`).
+fn default_favorites() -> Vec<Favorite> {
+    quick_access()
+        .into_iter()
+        .map(|(name, path)| {
+            let custom = (name != display_name(&path)).then_some(name);
+            Favorite { path, name: custom }
+        })
+        .collect()
+}
+
 fn is_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -369,7 +395,10 @@ impl FilesApp {
         target_fps: u32,
     ) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let prefs = Prefs::load();
+        let mut prefs = Prefs::load();
+        if prefs.ensure_favorites(default_favorites()) {
+            prefs.save();
+        }
         let mut tab = Pane::new(initial_dir.clone());
         tab.rebuild(&prefs);
         if let Some(sel) = &initial_select {
@@ -423,6 +452,7 @@ impl FilesApp {
             focus: Side::Main,
             prefs,
             css,
+            font: Default::default(),
             theme: None,
             target_fps: target_fps.max(60),
             drives: Vec::new(),
@@ -459,6 +489,9 @@ impl FilesApp {
                 .map(|(_, c)| c.theme.app_mode("files"))
                 .unwrap_or(chickenwm_core::theme::AppMode::System),
             _config_watcher: config_watcher,
+            fav_drag: None,
+            fav_rename: None,
+            sidebar_collapsed: Default::default(),
         };
         app.refresh_drives();
         app
@@ -728,13 +761,23 @@ impl FilesApp {
                 }
             }
             Action::Pin(path) => {
-                if !self.prefs.pinned.contains(&path) {
-                    self.prefs.pinned.push(path);
-                    self.prefs.save();
-                }
+                self.prefs.add_favorite(path);
+                self.prefs.save();
             }
             Action::Unpin(path) => {
-                self.prefs.pinned.retain(|p| p != &path);
+                self.prefs.remove_favorite(&path);
+                self.prefs.save();
+            }
+            Action::MoveFavorite { from, to } => {
+                self.prefs.move_favorite(from, to);
+                self.prefs.save();
+            }
+            Action::RenameFavorite { path, name } => {
+                self.prefs.rename_favorite(&path, name);
+                self.prefs.save();
+            }
+            Action::ResetFavorites => {
+                self.prefs.favorites = Some(default_favorites());
                 self.prefs.save();
             }
             Action::Transfer { sources, dest, kind } => {
@@ -921,7 +964,7 @@ impl FilesApp {
         let paste_edge = paste_now && !self.paste_down;
         self.paste_down = paste_now;
 
-        if ctx.wants_keyboard_input() || self.rename.is_some() || self.address.is_some() {
+        if ctx.wants_keyboard_input() || self.rename.is_some() || self.address.is_some() || self.fav_rename.is_some() {
             return;
         }
         let side = self.focused();
@@ -1272,9 +1315,9 @@ fn item_menu(ui: &mut egui::Ui, side: Side, entry: &Entry, targets: &[PathBuf], 
     item(ui, "Create shortcut", "", Action::Shortcut(t()));
     if entry.is_dir && single {
         if pinned {
-            item(ui, "Unpin from Quick access", "", Action::Unpin(entry.path.clone()));
+            item(ui, "Remove from Favorites", "", Action::Unpin(entry.path.clone()));
         } else {
-            item(ui, "Pin to Quick access", "", Action::Pin(entry.path.clone()));
+            item(ui, "Add to Favorites", "", Action::Pin(entry.path.clone()));
         }
         item(ui, "Open in Terminal", "", Action::Terminal(entry.path.clone()));
     }
@@ -1341,7 +1384,7 @@ fn background_menu(ui: &mut egui::Ui, side: Side, cwd: &Path, prefs: &Prefs, pin
     if ui.button("Open in Terminal").clicked() {
         push(ui, Action::Terminal(cwd.to_path_buf()));
     }
-    if ui.button(if pinned { "Unpin from Quick access" } else { "Pin to Quick access" }).clicked() {
+    if ui.button(if pinned { "Remove from Favorites" } else { "Add to Favorites" }).clicked() {
         push(ui, if pinned { Action::Unpin(cwd.to_path_buf()) } else { Action::Pin(cwd.to_path_buf()) });
     }
     let mut hidden = prefs.show_hidden;
@@ -1381,7 +1424,7 @@ impl Draw<'_> {
             self.zones.push(DropZone { rect, dir: entry.path.clone() });
         }
         let targets = if pane.selection.contains(&entry.path) { pane.targets() } else { vec![entry.path.clone()] };
-        let pinned = self.prefs.pinned.contains(&entry.path);
+        let pinned = self.prefs.is_favorite(&entry.path);
         let actions = &mut *self.actions;
         resp.context_menu(|ui| item_menu(ui, side, entry, &targets, pinned, dual, actions));
     }
@@ -1465,7 +1508,7 @@ impl Draw<'_> {
             self.actions.push(Action::ClearSelection(side));
         }
         self.zones.push(DropZone { rect, dir: pane.cwd.clone() });
-        let pinned = self.prefs.pinned.contains(&pane.cwd);
+        let pinned = self.prefs.is_favorite(&pane.cwd);
         let (cwd, prefs, actions) = (pane.cwd.clone(), self.prefs, &mut *self.actions);
         resp.context_menu(|ui| background_menu(ui, side, &cwd, prefs, pinned, actions));
     }
@@ -1530,6 +1573,10 @@ impl Draw<'_> {
                 let Some(entry) = pane.entry_at(pos) else { continue };
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 let selected = pane.selection.contains(&entry.path);
+                // Finder's alternating row stripes.
+                if pos % 2 == 1 && !selected {
+                    ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
+                }
                 self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
                 let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
                 paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
@@ -1630,6 +1677,7 @@ impl eframe::App for FilesApp {
             self.hwnd = h;
         }
         let theme = Theme::from_css(&self.css.read());
+        self.font.sync(ctx, &self.css.read(), false);
         let config_changed = self.config_changed.swap(false, Ordering::Relaxed);
         if config_changed {
             if let Ok((_, c)) = chickenwm_core::config::load_or_init_config() {
@@ -1683,8 +1731,7 @@ impl eframe::App for FilesApp {
         self.draw_top(ctx, theme, &mut actions);
         self.draw_status(ctx, theme);
         self.draw_sidebar(ctx, theme, &mut actions);
-        self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
-        self.handle_drag_and_drop(ctx, theme, &mut actions);
+        self.draw_center(ctx, theme, &mut actions, &mut commit_rename);        self.handle_drag_and_drop(ctx, theme, &mut actions);
 
         for a in actions {
             self.apply(a);
@@ -1701,88 +1748,31 @@ impl FilesApp {
     fn draw_top(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
         let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin::symmetric(8, 6));
         egui::TopBottomPanel::top("files_top").frame(frame).show(ctx, |ui| {
-            // Tabs
-            ui.horizontal(|ui| {
-                for i in 0..self.tabs.len() {
-                    let active = i == self.active;
-                    let title = self.tabs[i].title();
-                    let fill = if active { th.pane } else { Color32::TRANSPARENT };
-                    let resp = egui::Frame::NONE
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(th.radius.min(8)))
-                        .inner_margin(egui::Margin::symmetric(10, 4))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                                paint_icon(ui, &mut self.icons, "dir", false, icon_rect, true, &th);
-                                let label = ui.add(egui::Label::new(egui::RichText::new(title).color(if active { th.fg } else { th.dim })).sense(Sense::click()).truncate());
-                                if self.tabs.len() > 1 && ui.add(egui::Button::new(egui::RichText::new("×").color(th.dim)).frame(false)).on_hover_text("Close tab (Ctrl+W)").clicked() {
-                                    actions.push(Action::CloseTab(i));
-                                }
-                                label
-                            })
-                            .inner
-                        });
-                    let label = resp.inner;
-                    let rect = resp.response.rect;
-                    let tab_resp = ui.interact(rect, ui.id().with(("tab", i)), Sense::click());
-                    if label.clicked() || tab_resp.clicked() {
-                        actions.push(Action::SwitchTab(i));
-                    }
-                    if label.middle_clicked() || tab_resp.middle_clicked() {
-                        actions.push(Action::CloseTab(i));
-                    }
-                    self.zones.push(DropZone { rect, dir: self.tabs[i].cwd.clone() });
-                    let n = self.tabs.len();
-                    tab_resp.union(label).context_menu(|ui| {
-                        if ui.button("New tab").clicked() {
-                            actions.push(Action::NewTab);
-                            ui.close_menu();
-                        }
-                        if ui.button("Duplicate tab").clicked() {
-                            actions.push(Action::DuplicateTab(i));
-                            ui.close_menu();
-                        }
-                        if ui.add_enabled(n > 1, egui::Button::new("Close tab")).clicked() {
-                            actions.push(Action::CloseTab(i));
-                            ui.close_menu();
-                        }
-                        if ui.add_enabled(n > 1, egui::Button::new("Close other tabs")).clicked() {
-                            actions.push(Action::CloseOtherTabs(i));
-                            ui.close_menu();
-                        }
-                    });
-                }
-                if ui.add(egui::Button::new("+").frame(false)).on_hover_text("New tab (Ctrl+T)").clicked() {
-                    actions.push(Action::NewTab);
-                }
-            });
-            ui.add_space(4.0);
 
             // Navigation, breadcrumbs, search, view switcher
             ui.horizontal(|ui| {
                 let side = self.focused();
                 let pane = self.pane(side);
+                // Finder: plain back/forward chevrons, then the folder's name.
                 let nav = |ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool| {
-                    ui.add_enabled(enabled, egui::Button::new(egui::RichText::new(glyph).size(th.font + 2.0)).min_size(egui::vec2(30.0, 28.0)))
+                    ui.add_enabled(enabled, egui::Button::new(egui::RichText::new(glyph).size(th.font + 6.0)).frame(false).min_size(egui::vec2(26.0, 28.0)))
                         .on_hover_text(tip)
                         .clicked()
                 };
-                if nav(ui, "⬅", "Back (Alt+Left)", !pane.back.is_empty()) {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if nav(ui, "‹", "Back (Alt+Left)", !pane.back.is_empty()) {
                     actions.push(Action::Back(side));
                 }
-                if nav(ui, "➡", "Forward (Alt+Right)", !pane.forward.is_empty()) {
+                if nav(ui, "›", "Forward (Alt+Right)", !pane.forward.is_empty()) {
                     actions.push(Action::Forward(side));
                 }
-                if nav(ui, "⬆", "Up (Alt+Up)", pane.cwd.parent().is_some()) {
-                    actions.push(Action::Up(side));
-                }
-                if nav(ui, "⟳", "Refresh (F5)", true) {
-                    actions.push(Action::Refresh);
-                }
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let folder = pane.title();
+                ui.add(egui::Label::new(egui::RichText::new(folder).strong().size(th.font + 1.5).color(th.fg)).truncate())
+                    .on_hover_text("Up a folder: Alt+Up · Refresh: F5");
 
-                let search_w = 220.0;
-                let views_w = 330.0;
+                let search_w = 200.0;
+                let views_w = 300.0;
                 let addr_w = (ui.available_width() - search_w - views_w - 24.0).max(160.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
@@ -1806,15 +1796,11 @@ impl FilesApp {
                 }
 
                 // Views + options
-                for (v, label, tip) in [
-                    (ViewMode::Details, "Details", "Ctrl+Shift+1"),
-                    (ViewMode::Icons, "Icons", "Ctrl+Shift+2"),
-                    (ViewMode::Columns, "Columns", "Ctrl+Shift+3"),
-                    (ViewMode::Dual, "Dual pane", "Ctrl+Shift+4"),
-                ] {
-                    if ui.selectable_label(self.prefs.view == v, label).on_hover_text(tip).clicked() {
-                        actions.push(Action::SetView(v));
-                    }
+                if let Some(v) = view_segments(ui, th, self.prefs.view) {
+                    actions.push(Action::SetView(v));
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("+").size(th.font + 2.0)).frame(false).min_size(egui::vec2(24.0, 28.0))).on_hover_text("New tab (Ctrl+T)").clicked() {
+                    actions.push(Action::NewTab);
                 }
                 ui.menu_button("⚙", |ui| {
                     let mut hidden = self.prefs.show_hidden;
@@ -1859,6 +1845,69 @@ impl FilesApp {
                     ui.label(egui::RichText::new("Keyboard: arrows/j k move · Enter/l open · Backspace/h up · F2 rename · Del recycle · Ctrl+C/X/V · / search").small().color(th.dim));
                 });
             });
+            // Tabs, Finder-style: only once there's more than one, sharing the width equally.
+            if self.tabs.len() > 1 {
+                ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let count = self.tabs.len() as f32;
+                let tab_w = ((ui.available_width() - 4.0 * (count - 1.0)) / count).max(90.0);
+                for i in 0..self.tabs.len() {
+                    let active = i == self.active;
+                    let title = self.tabs[i].title();
+                    let fill = if active { th.pane } else { th.fg.gamma_multiply(0.04) };
+                    let resp = egui::Frame::NONE
+                        .fill(fill)
+                        .corner_radius(CornerRadius::same(th.radius.clamp(4, 7)))
+                        .stroke(Stroke::new(1.0_f32, if active { th.border } else { Color32::TRANSPARENT }))
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.set_width(tab_w - 18.0);
+                            // Close on the left, title centred (Finder).
+                            ui.horizontal(|ui| {
+                                let close = ui.add(egui::Button::new(egui::RichText::new("×").color(th.dim)).frame(false)).on_hover_text("Close tab (Ctrl+W)");
+                                if close.clicked() {
+                                    actions.push(Action::CloseTab(i));
+                                }
+                                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(title).color(if active { th.fg } else { th.dim })).sense(Sense::click()).truncate())
+                                })
+                                .inner
+                            })
+                            .inner
+                        });
+                    let label = resp.inner;
+                    let rect = resp.response.rect;
+                    let tab_resp = ui.interact(rect, ui.id().with(("tab", i)), Sense::click());
+                    if label.clicked() || tab_resp.clicked() {
+                        actions.push(Action::SwitchTab(i));
+                    }
+                    if label.middle_clicked() || tab_resp.middle_clicked() {
+                        actions.push(Action::CloseTab(i));
+                    }
+                    self.zones.push(DropZone { rect, dir: self.tabs[i].cwd.clone() });
+                    let n = self.tabs.len();
+                    tab_resp.union(label).context_menu(|ui| {
+                        if ui.button("New tab").clicked() {
+                            actions.push(Action::NewTab);
+                            ui.close_menu();
+                        }
+                        if ui.button("Duplicate tab").clicked() {
+                            actions.push(Action::DuplicateTab(i));
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(n > 1, egui::Button::new("Close tab")).clicked() {
+                            actions.push(Action::CloseTab(i));
+                            ui.close_menu();
+                        }
+                        if ui.add_enabled(n > 1, egui::Button::new("Close other tabs")).clicked() {
+                            actions.push(Action::CloseOtherTabs(i));
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+            }
         });
     }
 
@@ -1936,7 +1985,29 @@ impl FilesApp {
 
     fn draw_status(&mut self, ctx: &egui::Context, th: Theme) {
         let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin::symmetric(10, 4));
+        let side = self.focused();
+        let mut go_to: Option<PathBuf> = None;
         egui::TopBottomPanel::bottom("files_status").frame(frame).show(ctx, |ui| {
+            // Finder's path bar: every folder up to here, each one clickable.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let cwd = self.pane(side).cwd.clone();
+                let mut chain: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
+                chain.reverse();
+                let last = chain.len().saturating_sub(1);
+                for (i, dir) in chain.iter().enumerate() {
+                    if i > 0 {
+                        ui.label(egui::RichText::new("›").color(th.dim));
+                    }
+                    let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                    paint_icon(ui, &mut self.icons, &format!("path:{}", dir.display()), false, icon_rect, true, &th);
+                    let text = egui::RichText::new(display_name(dir)).size(th.font - 1.5).color(if i == last { th.fg } else { th.dim });
+                    if ui.add(egui::Button::new(text).frame(false)).clicked() && i != last {
+                        go_to = Some(dir.clone());
+                    }
+                }
+            });
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let pane = self.pane(self.focused());
                 let mut text = format!("{} items", pane.visible.len());
@@ -1985,63 +2056,203 @@ impl FilesApp {
                 });
             });
         });
+        if let Some(dir) = go_to {
+            self.apply(Action::Navigate(side, dir));
+        }
     }
 
+    /// Finder-style sidebar: "Favorites" (the user's own folders: add, remove, rename, drag to
+    /// reorder) and "Locations" (drives). Each section folds away from its header.
     fn draw_sidebar(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
-        let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin::symmetric(8, 8));
-        egui::SidePanel::left("files_sidebar").resizable(true).default_width(200.0).width_range(150.0..=340.0).frame(frame).show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let cwd = self.pane(self.focused()).cwd.clone();
-                let side = self.focused();
-                let section = |ui: &mut egui::Ui, title: &str| {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(title).small().strong().color(th.dim));
-                };
-                section(ui, "QUICK ACCESS");
-                for (name, path) in quick_access() {
-                    self.sidebar_item(ui, th, &name, &format!("path:{}", path.display()), &path, cwd == path, side, false, None, actions);
-                }
-                if !self.prefs.pinned.is_empty() {
-                    section(ui, "PINNED");
-                    for path in self.prefs.pinned.clone() {
-                        self.sidebar_item(ui, th, &display_name(&path), "dir", &path, cwd == path, side, true, None, actions);
+        let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 });
+        egui::SidePanel::left("files_sidebar")
+            .resizable(true)
+            .default_width(210.0)
+            .width_range(160.0..=340.0)
+            .show_separator_line(false)
+            .frame(frame)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let cwd = self.pane(self.focused()).cwd.clone();
+                    let side = self.focused();
+
+                    if self.sidebar_section(ui, th, "Favorites", &cwd, actions) {
+                        let favorites = self.prefs.favorites().to_vec();
+                        let mut rows = Vec::with_capacity(favorites.len());
+                        for (i, fav) in favorites.iter().enumerate() {
+                            let key = format!("path:{}", fav.path.display());
+                            let resp = self.sidebar_item(ui, th, &fav.label(), &key, &fav.path, cwd == fav.path, side, Some(i), None, actions);
+                            if resp.drag_started() && self.fav_rename.is_none() {
+                                self.fav_drag = Some(i);
+                            }
+                            rows.push(resp.rect);
+                        }
+                        if favorites.is_empty() {
+                            ui.add_space(2.0);
+                            ui.label(egui::RichText::new("Add folders with + or by right-clicking them").small().color(th.dim));
+                        }
+                        self.favorite_reorder(ui, th, &rows, &favorites, actions);
                     }
+
+                    ui.add_space(10.0);
+                    if self.sidebar_section(ui, th, "Locations", &cwd, actions) {
+                        let drives: Vec<(PathBuf, String, Option<(u64, u64)>)> =
+                            self.drives.iter().map(|d| (d.root.clone(), d.label.clone(), d.space)).collect();
+                        for (root, label, space) in drives {
+                            let letter = root.display().to_string().trim_end_matches('\\').to_string();
+                            let name = format!("{label} ({letter})");
+                            let key = format!("path:{}", root.display());
+                            self.sidebar_item(ui, th, &name, &key, &root, cwd == root, side, None, space, actions);
+                        }
+                    }
+                });
+            });
+    }
+
+    /// A section header (small, dim, like Finder's). Click folds the section; Favorites also
+    /// gets a + (add the current folder) on hover and a menu to restore the defaults.
+    /// Returns whether the section is expanded.
+    fn sidebar_section(&mut self, ui: &mut egui::Ui, th: Theme, title: &'static str, cwd: &Path, actions: &mut Vec<Action>) -> bool {
+        let favorites = title == "Favorites";
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
+        let collapsed = self.sidebar_collapsed.contains(title);
+        let hovered = ui.rect_contains_pointer(rect);
+        ui.painter().text(
+            Pos2::new(rect.left() + 6.0, rect.center().y + 1.0),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(th.font - 2.5),
+            th.dim,
+        );
+        let mut x = rect.right() - 4.0;
+        if favorites && hovered {
+            let plus = Rect::from_center_size(Pos2::new(x - 9.0, rect.center().y), Vec2::splat(18.0));
+            let plus_resp = ui.interact(plus, ui.id().with("fav-add"), Sense::click());
+            if plus_resp.hovered() {
+                ui.painter().rect_filled(plus, 4.0_f32, th.fg.gamma_multiply(0.08));
+            }
+            ui.painter().text(plus.center(), Align2::CENTER_CENTER, "+", FontId::proportional(th.font + 1.0), th.dim);
+            if plus_resp.on_hover_text("Add this folder to Favorites").clicked() {
+                actions.push(Action::Pin(cwd.to_path_buf()));
+            }
+            x -= 22.0;
+        }
+        if hovered {
+            ui.painter().text(
+                Pos2::new(x, rect.center().y + 1.0),
+                Align2::RIGHT_CENTER,
+                if collapsed { "Show" } else { "Hide" },
+                FontId::proportional(th.font - 3.0),
+                th.dim,
+            );
+        }
+        if resp.clicked() {
+            if collapsed {
+                self.sidebar_collapsed.remove(title);
+            } else {
+                self.sidebar_collapsed.insert(title);
+            }
+        }
+        if favorites {
+            let cwd = cwd.to_path_buf();
+            resp.context_menu(|ui| {
+                if ui.button("Add this folder").clicked() {
+                    actions.push(Action::Pin(cwd.clone()));
+                    ui.close_menu();
                 }
-                section(ui, "THIS PC");
-                let drives: Vec<(PathBuf, String, Option<(u64, u64)>)> =
-                    self.drives.iter().map(|d| (d.root.clone(), d.label.clone(), d.space)).collect();
-                for (root, label, space) in drives {
-                    let letter = root.display().to_string().trim_end_matches('\\').to_string();
-                    let name = format!("{label} ({letter})");
-                    let key = format!("path:{}", root.display());
-                    self.sidebar_item(ui, th, &name, &key, &root, cwd == root, side, false, space, actions);
+                if ui.button("Restore default favorites").clicked() {
+                    actions.push(Action::ResetFavorites);
+                    ui.close_menu();
                 }
             });
-        });
+        }
+        !collapsed
     }
 
+    /// While a favorite is dragged: an insertion line where it would land and a floating label
+    /// under the pointer; dropping moves it there.
+    fn favorite_reorder(&mut self, ui: &mut egui::Ui, th: Theme, rows: &[Rect], favorites: &[Favorite], actions: &mut Vec<Action>) {
+        let Some(from) = self.fav_drag else { return };
+        let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
+        if rows.is_empty() || from >= favorites.len() {
+            self.fav_drag = None;
+            return;
+        }
+        let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(rows.len());
+        let y = if to < rows.len() { rows[to].top() } else { rows[rows.len() - 1].bottom() };
+        let left = rows[0].left() + 6.0;
+        let right = rows[0].right() - 6.0;
+        if to != from && to != from + 1 {
+            ui.painter().line_segment([Pos2::new(left + 4.0, y), Pos2::new(right, y)], Stroke::new(2.0_f32, th.accent));
+            ui.painter().circle_stroke(Pos2::new(left, y), 3.0, Stroke::new(2.0_f32, th.accent));
+        }
+        // The dragged favorite follows the pointer.
+        let ghost = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("fav-drag-ghost")));
+        let galley = ghost.layout_no_wrap(favorites[from].label(), FontId::proportional(th.font - 0.5), th.fg);
+        let pill = Rect::from_min_size(pointer + egui::vec2(12.0, 6.0), galley.size() + egui::vec2(16.0, 8.0));
+        ghost.rect_filled(pill, 6.0_f32, th.pane);
+        ghost.rect_stroke(pill, 6.0_f32, Stroke::new(1.0_f32, th.border), egui::StrokeKind::Inside);
+        ghost.galley(pill.min + egui::vec2(8.0, 4.0), galley, th.fg);
+        if ui.input(|i| i.pointer.any_released()) {
+            actions.push(Action::MoveFavorite { from, to });
+            self.fav_drag = None;
+        }
+    }
+
+    /// One sidebar row: icon + name in a rounded pill. `favorite` is the row's index in
+    /// Favorites (rows there can be dragged, renamed and removed); drives show a usage bar.
     #[allow(clippy::too_many_arguments)]
-    fn sidebar_item(&mut self, ui: &mut egui::Ui, th: Theme, name: &str, icon_key: &str, path: &Path, active: bool, side: Side, pinned: bool, space: Option<(u64, u64)>, actions: &mut Vec<Action>) {
+    fn sidebar_item(&mut self, ui: &mut egui::Ui, th: Theme, name: &str, icon_key: &str, path: &Path, active: bool, side: Side, favorite: Option<usize>, space: Option<(u64, u64)>, actions: &mut Vec<Action>) -> egui::Response {
         let h = if space.is_some() { th.row_h + 10.0 } else { th.row_h };
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
-        let radius = CornerRadius::same(th.radius.min(6));
+        let sense = if favorite.is_some() { Sense::click_and_drag() } else { Sense::click() };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), sense);
+        let radius = CornerRadius::same(th.radius.clamp(4, 7));
+        let dragging_this = favorite.is_some() && self.fav_drag == favorite;
         if active {
             ui.painter().rect_filled(rect, radius, th.selected);
-        } else if resp.hovered() {
+        } else if resp.hovered() && self.fav_drag.is_none() {
             ui.painter().rect_filled(rect, radius, th.fg.gamma_multiply(0.06));
         }
+        let fade = if dragging_this { 0.4 } else { 1.0 };
         let row_center = Pos2::new(rect.left(), rect.top() + th.row_h / 2.0);
-        let icon = Rect::from_center_size(row_center + egui::vec2(16.0, 0.0), Vec2::splat(16.0));
+        let icon = Rect::from_center_size(row_center + egui::vec2(15.0, 0.0), Vec2::splat(16.0));
         paint_icon(ui, &mut self.icons, icon_key, false, icon, true, &th);
-        ui.painter().with_clip_rect(rect).text(row_center + egui::vec2(32.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 0.5), th.fg);
+
+        let renaming = favorite.is_some() && self.fav_rename.as_ref().is_some_and(|r| r.0 == path);
+        if renaming {
+            let field = Rect::from_min_max(Pos2::new(rect.left() + 28.0, rect.top() + 2.0), Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
+            let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if let Some((_, buffer, focused)) = self.fav_rename.as_mut() {
+                let edit = ui.put(field, egui::TextEdit::singleline(buffer).margin(egui::Margin::symmetric(4, 1)).font(FontId::proportional(th.font - 0.5)));
+                if !*focused {
+                    edit.request_focus();
+                    *focused = true;
+                } else if esc {
+                    self.fav_rename = None;
+                } else if enter || edit.lost_focus() {
+                    if let Some((path, buffer, _)) = self.fav_rename.take() {
+                        actions.push(Action::RenameFavorite { path, name: Some(buffer) });
+                    }
+                }
+            }
+        } else {
+            ui.painter().with_clip_rect(rect.shrink(2.0)).text(
+                row_center + egui::vec2(30.0, 0.0),
+                Align2::LEFT_CENTER,
+                name,
+                FontId::proportional(th.font - 0.5),
+                th.fg.gamma_multiply(fade),
+            );
+        }
         if let Some((free, total)) = space.filter(|(_, t)| *t > 0) {
             let used = 1.0 - free as f32 / total as f32;
-            let bar = Rect::from_min_size(Pos2::new(rect.left() + 32.0, rect.bottom() - 9.0), egui::vec2(rect.width() - 42.0, 4.0));
+            let bar = Rect::from_min_size(Pos2::new(rect.left() + 30.0, rect.bottom() - 9.0), egui::vec2(rect.width() - 40.0, 4.0));
             ui.painter().rect_filled(bar, 2.0_f32, th.border);
             let fill = if used > 0.9 { Color32::from_rgb(243, 139, 168) } else { th.accent };
             ui.painter().rect_filled(Rect::from_min_size(bar.min, egui::vec2(bar.width() * used, 4.0)), 2.0_f32, fill);
         }
-        if resp.clicked() {
+        if resp.clicked() && !renaming {
             actions.push(Action::Navigate(side, path.to_path_buf()));
         }
         if resp.middle_clicked() {
@@ -2050,8 +2261,14 @@ impl FilesApp {
         if let Some((free, total)) = space {
             resp.clone().on_hover_text(format!("{} free of {}", format_bytes(free), format_bytes(total)));
         }
-        self.zones.push(DropZone { rect, dir: path.to_path_buf() });
+        if self.fav_drag.is_none() {
+            // Files dropped on a sidebar folder go into it.
+            self.zones.push(DropZone { rect, dir: path.to_path_buf() });
+        }
         let path = path.to_path_buf();
+        let is_favorite = favorite.is_some();
+        let label = name.to_string();
+        let mut rename = None;
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             if ui.button("Open").clicked() {
@@ -2070,8 +2287,18 @@ impl FilesApp {
                 actions.push(Action::Terminal(path.clone()));
                 ui.close_menu();
             }
-            if pinned && ui.button("Unpin from Quick access").clicked() {
-                actions.push(Action::Unpin(path.clone()));
+            ui.separator();
+            if is_favorite {
+                if ui.button("Rename…").clicked() {
+                    rename = Some(label.clone());
+                    ui.close_menu();
+                }
+                if ui.button("Remove from Favorites").clicked() {
+                    actions.push(Action::Unpin(path.clone()));
+                    ui.close_menu();
+                }
+            } else if ui.button("Add to Favorites").clicked() {
+                actions.push(Action::Pin(path.clone()));
                 ui.close_menu();
             }
             ui.separator();
@@ -2080,6 +2307,10 @@ impl FilesApp {
                 ui.close_menu();
             }
         });
+        if let Some(current) = rename {
+            self.fav_rename = Some((path, current, false));
+        }
+        resp
     }
 
     fn draw_preview(&mut self, ui: &mut egui::Ui, th: Theme) {
@@ -2321,6 +2552,43 @@ impl FilesApp {
             }
         }
     }
+}
+
+/// Finder's view switcher: one rounded group with the current view raised. Returns a new pick.
+fn view_segments(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<ViewMode> {
+    const VIEWS: [(ViewMode, &str, &str); 4] = [
+        (ViewMode::Details, "List", "Ctrl+Shift+1"),
+        (ViewMode::Icons, "Icons", "Ctrl+Shift+2"),
+        (ViewMode::Columns, "Columns", "Ctrl+Shift+3"),
+        (ViewMode::Dual, "Dual", "Ctrl+Shift+4"),
+    ];
+    let font = FontId::proportional(th.font - 1.0);
+    let widths: Vec<f32> = VIEWS
+        .iter()
+        .map(|(_, label, _)| ui.painter().layout_no_wrap(label.to_string(), font.clone(), th.fg).size().x + 20.0)
+        .collect();
+    let (group, _) = ui.allocate_exact_size(egui::vec2(widths.iter().sum::<f32>() + 4.0, 28.0), Sense::hover());
+    let radius = CornerRadius::same(th.radius.clamp(5, 8));
+    ui.painter().rect_filled(group, radius, th.fg.gamma_multiply(0.07));
+    let mut x = group.left() + 2.0;
+    let mut picked = None;
+    for ((view, label, tip), w) in VIEWS.iter().zip(widths) {
+        let seg = Rect::from_min_size(Pos2::new(x, group.top() + 2.0), egui::vec2(w, group.height() - 4.0));
+        x += w;
+        let resp = ui.interact(seg, ui.id().with(("view-seg", *label)), Sense::click()).on_hover_text(*tip);
+        let selected = *view == current;
+        if selected {
+            ui.painter().rect_filled(seg, CornerRadius::same(th.radius.clamp(4, 6)), th.pane);
+            ui.painter().rect_stroke(seg, CornerRadius::same(th.radius.clamp(4, 6)), Stroke::new(1.0_f32, th.border), egui::StrokeKind::Inside);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(seg, CornerRadius::same(th.radius.clamp(4, 6)), th.fg.gamma_multiply(0.05));
+        }
+        ui.painter().text(seg.center(), Align2::CENTER_CENTER, *label, font.clone(), if selected { th.fg } else { th.dim });
+        if resp.clicked() && !selected {
+            picked = Some(*view);
+        }
+    }
+    picked
 }
 
 /// `C:\` for any path on drive C.
