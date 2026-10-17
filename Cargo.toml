@@ -1,0 +1,36 @@
+[package]
+name = "chickenwm-files"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chickenwm-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+nucleo-matcher.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+notify.workspace = true
+raw-window-handle = "0.6"
+# Needed by `#[windows::core::implement]` (OLE drop source); must match the `windows` version.
+windows-core = "0.58"
+windows = { workspace = true, features = [
+    "implement",
+    "Win32_System_Ole",
+    "Win32_System_DataExchange",
+    "Win32_System_Time",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Controls",
+] }
