@@ -7,6 +7,10 @@
 //! - `icons`: shell icons and type names; `model`: directory model, sorting, archives, prefs
 //! - Live CSS styling (`~/.config/chickenwm/files.css`) and live folder refresh (file watcher)
 
+// Release builds are windowed apps: no console window when launched from the shell, a
+// hotkey or the launcher. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod icons;
 mod model;

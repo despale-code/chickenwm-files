@@ -5,6 +5,8 @@
 //! applied after the frame's layout, so every view (and every menu) shares one implementation
 //! of each command.
 
+mod preview;
+
 use crate::icons::IconCache;
 use crate::model::{
     archive_stem, compress_zip, extract_archive, format_bytes, format_time, is_archive, read_directory,
@@ -155,7 +157,9 @@ impl Theme {
     }
 
     fn apply(&self, ctx: &egui::Context) {
-        let mut v = egui::Visuals::dark();
+        let [br, bgc, bb, _] = self.bg.to_array();
+        let light = (0.2126 * br as f32 + 0.7152 * bgc as f32 + 0.0722 * bb as f32) / 255.0 > 0.5;
+        let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = self.bg;
         v.window_fill = self.pane;
         v.extreme_bg_color = self.sidebar;
@@ -240,6 +244,7 @@ struct Preview {
     text: String,
     image: Option<(egui::TextureHandle, [usize; 2])>,
     loading_image: bool,
+    kind: preview::Kind,
 }
 
 struct ScrollMemo {
@@ -286,6 +291,8 @@ pub struct FilesApp {
     title: String,
     /// Set when chickenwm.conf changes (icon theme may have changed).
     config_changed: Arc<AtomicBool>,
+    /// This app's light/dark choice in the master theme provider (`app_modes = files:…`).
+    app_mode: chickenwm_core::theme::AppMode,
     _config_watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -434,6 +441,9 @@ impl FilesApp {
             child_cache: (PathBuf::new(), Vec::new()),
             title: String::new(),
             config_changed,
+            app_mode: chickenwm_core::config::load_or_init_config()
+                .map(|(_, c)| c.theme.app_mode("files"))
+                .unwrap_or(chickenwm_core::theme::AppMode::System),
             _config_watcher: config_watcher,
         };
         app.refresh_drives();
@@ -1127,6 +1137,7 @@ impl FilesApp {
         let Some(entry) = current else { return };
         if !entry.is_dir && is_image(&entry.path) && entry.size < 60 * 1024 * 1024 {
             self.preview.loading_image = true;
+            self.preview.kind = preview::Kind::Image;
             let tx = self.image_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
@@ -1145,6 +1156,7 @@ impl FilesApp {
             });
         } else {
             self.preview.text = text_preview(&entry);
+            self.preview.kind = preview::classify(&entry, &self.preview.text);
         }
     }
 }
@@ -1605,6 +1617,11 @@ impl eframe::App for FilesApp {
         }
         let theme = Theme::from_css(&self.css.read());
         let config_changed = self.config_changed.swap(false, Ordering::Relaxed);
+        if config_changed {
+            if let Ok((_, c)) = chickenwm_core::config::load_or_init_config() {
+                self.app_mode = c.theme.app_mode("files");
+            }
+        }
         if self.theme != Some(theme) || config_changed {
             theme.apply(ctx);
             if self.theme.is_some() {
@@ -1801,6 +1818,19 @@ impl FilesApp {
                         self.prefs.show_extensions = ext;
                         self.prefs.save();
                         ui.close_menu();
+                    }
+                    ui.separator();
+                    // Same light/dark option as every ChickenWM app (master theme provider).
+                    ui.label(egui::RichText::new("Appearance").small().color(th.dim));
+                    use chickenwm_core::theme::AppMode;
+                    for (m, label) in [(AppMode::System, "Follow system"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")] {
+                        if ui.radio(self.app_mode == m, label).clicked() {
+                            self.app_mode = m;
+                            if let Err(e) = chickenwm_core::theme::set_app_mode("files", m) {
+                                self.toast(format!("Couldn't change appearance: {e}"), true);
+                            }
+                            ui.close_menu();
+                        }
                     }
                     ui.separator();
                     if ui.button("New folder").clicked() {
@@ -2045,10 +2075,11 @@ impl FilesApp {
             return;
         };
         ui.vertical_centered(|ui| {
-            ui.add_space(8.0);
-            let icon_rect = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover()).0;
+            ui.add_space(6.0);
+            let icon_rect = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover()).0;
             paint_icon(ui, &mut self.icons, &entry.icon_key, true, icon_rect, entry.is_dir, &th);
-            ui.label(egui::RichText::new(&entry.name).strong().color(th.name_color(&entry)));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(egui::RichText::new(&entry.name).strong().size(th.font + 1.0).color(th.name_color(&entry))).wrap());
             let mut meta = type_label(&self.icons, &entry);
             if !entry.is_dir {
                 meta.push_str(&format!(" · {}", format_bytes(entry.size)));
@@ -2057,23 +2088,10 @@ impl FilesApp {
             if let Some(t) = entry.modified {
                 ui.label(egui::RichText::new(format!("Modified {}", format_time(t))).small().color(th.dim));
             }
+            ui.add_space(8.0);
         });
-        ui.separator();
-        egui::ScrollArea::vertical().id_salt("preview").auto_shrink([false, false]).show(ui, |ui| {
-            if let Some((tex, dims)) = &self.preview.image {
-                let avail = ui.available_width();
-                let size = tex.size_vec2();
-                let scale = (avail / size.x).min(1.0);
-                ui.add(egui::Image::new(tex).fit_to_exact_size(size * scale).corner_radius(CornerRadius::same(th.radius.min(8))));
-                ui.label(egui::RichText::new(format!("{} × {} px", dims[0], dims[1])).small().color(th.dim));
-            } else if self.preview.loading_image {
-                ui.spinner();
-            } else {
-                ui.add(egui::Label::new(egui::RichText::new(&self.preview.text).monospace().size(th.font - 2.0)).wrap());
-            }
-        });
+        preview::body(ui, &th, &self.preview, "preview");
     }
-
     fn draw_center(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>, commit_rename: &mut bool) {
         if self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons) {
             let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::same(10)).stroke(Stroke::new(1.0_f32, th.border));
@@ -2154,20 +2172,10 @@ impl FilesApp {
                                     ui.label(egui::RichText::new("This folder is empty").color(th.dim));
                                 }
                                 draw.name_column(ui, "col_child", &child_entries, None, Side::Main);
-                            } else if let Some((tex, dims)) = &preview.image {
-                                let size = tex.size_vec2();
-                                let scale = (ui.available_width() / size.x).min(1.0);
-                                ui.add(egui::Image::new(tex).fit_to_exact_size(size * scale).corner_radius(CornerRadius::same(th.radius.min(8))));
-                                ui.label(egui::RichText::new(format!("{} × {} px", dims[0], dims[1])).small().color(th.dim));
-                            } else if preview.loading_image {
-                                ui.spinner();
                             } else {
-                                egui::ScrollArea::vertical().id_salt("col_preview").auto_shrink([false, false]).show(ui, |ui| {
-                                    ui.add(egui::Label::new(egui::RichText::new(&preview.text).monospace().size(th.font - 2.0)).wrap());
-                                });
+                                preview::body(ui, &th, preview, "col_preview");
                             }
-                        });
-                        memo
+                        });                        memo
                     });
                     self.scroll.insert(Side::Main, memo);
                 }
