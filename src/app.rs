@@ -159,6 +159,9 @@ impl Theme {
     fn apply(&self, ctx: &egui::Context) {
         let [br, bgc, bb, _] = self.bg.to_array();
         let light = (0.2126 * br as f32 + 0.7152 * bgc as f32 + 0.0722 * bb as f32) / 255.0 > 0.5;
+        // Pin egui's theme to the palette: otherwise it follows the OS and its per-theme style
+        // slot (and `dark_mode` flag) can disagree with our colours, leaving the app stuck dark.
+        ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
         let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = self.bg;
         v.window_fill = self.pane;
@@ -393,9 +396,20 @@ impl FilesApp {
             let flag = config_changed.clone();
             let ctx = ctx.clone();
             chickenwm_core::css::spawn_config_watcher(move |ev| {
-                if let chickenwm_core::css::ConfigWatchEvent::HyprConfChanged(_) = ev {
-                    flag.store(true, Ordering::Relaxed);
-                    ctx.request_repaint();
+                match ev {
+                    chickenwm_core::css::ConfigWatchEvent::HyprConfChanged(_) => {
+                        flag.store(true, Ordering::Relaxed);
+                        ctx.request_repaint();
+                    }
+                    // main.rs reloads the sheet on its own watcher thread; wake the UI now and
+                    // again shortly after so the new palette is picked up even if we raced it.
+                    chickenwm_core::css::ConfigWatchEvent::CssChanged { file_name, .. }
+                        if file_name.eq_ignore_ascii_case("files.css") =>
+                    {
+                        ctx.request_repaint();
+                        ctx.request_repaint_after(Duration::from_millis(150));
+                    }
+                    _ => {}
                 }
             })
             .ok()
