@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chickenwm-core = { workspace = true, features = ["egui"] }
+chickenwm-core = { workspace = true, features = ["egui", "headless"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,6 +23,7 @@ zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
 notify.workspace = true
+regex = "1"
 raw-window-handle = "0.6"
 # Needed by `#[windows::core::implement]` (OLE drop source); must match the `windows` version.
 windows-core = "0.58"

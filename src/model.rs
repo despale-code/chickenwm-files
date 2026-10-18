@@ -524,14 +524,21 @@ pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     (1..).map(make).find(|p| !p.exists()).unwrap()
 }
 
+/// Windows' own bsdtar (reads 7z / rar), not a GNU tar that may come first on PATH.
+pub fn system_tar() -> PathBuf {
+    let sys = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let tar = sys.join(r"System32\tar.exe");
+    if tar.exists() { tar } else { PathBuf::from("tar.exe") }
+}
+
 pub fn is_archive(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
-    l.ends_with(".zip") || l.ends_with(".tar.gz") || l.ends_with(".tgz") || l.ends_with(".tar")
+    [".zip", ".tar.gz", ".tgz", ".tar", ".7z", ".rar"].iter().any(|s| l.ends_with(s))
 }
 
 pub fn archive_stem(name: &str) -> &str {
     let l = name.to_ascii_lowercase();
-    for suffix in [".tar.gz", ".tgz", ".zip", ".tar"] {
+    for suffix in [".tar.gz", ".tgz", ".zip", ".tar", ".7z", ".rar"] {
         if l.ends_with(suffix) {
             return &name[..name.len() - suffix.len()];
         }
@@ -561,6 +568,17 @@ pub fn extract_archive(archive: &Path, dest: &Path, progress: &dyn Fn(f32)) -> a
             }
             progress((i + 1) as f32 / len as f32);
         }
+    } else if lower.ends_with(".7z") || lower.ends_with(".rar") {
+        // Windows' bsdtar (tar.exe) reads 7z and rar.
+        use std::os::windows::process::CommandExt;
+        let status = std::process::Command::new(system_tar())
+            .arg("-xf")
+            .arg(archive)
+            .arg("-C")
+            .arg(dest)
+            .creation_flags(0x0800_0000)
+            .status()?;
+        anyhow::ensure!(status.success(), "tar.exe couldn't extract this archive");
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
         tar::Archive::new(GzDecoder::new(File::open(archive)?)).unpack(dest)?;
     } else {

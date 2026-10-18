@@ -145,9 +145,21 @@ fn main() -> Result<()> {
         }
     });
 
-    let (initial_dir, initial_select) = resolve_launch_target(&cli.path);
+    // `--render-to out.png [--render-size WxH]`: one frame, headless (the path argument swallows
+    // every argument, so the render flags are taken out of it first).
+    let render = chickenwm_core::headless::RenderRequest::from_args([1240.0, 760.0]);
+    let path = chickenwm_core::headless::strip_render_args(&cli.path);
+    let (initial_dir, initial_select) = resolve_launch_target(&path);
+    if let Some(req) = render {
+        return chickenwm_core::headless::render_app(&req, |cc| {
+            app::FilesApp::new(cc, initial_dir, initial_select, css, target_fps)
+        });
+    }
 
     let native_options = eframe::NativeOptions {
+        // glow, not wgpu: egui_kittest (headless feature) also enables eframe's wgpu backend,
+        // which eframe would then prefer, and wgpu draws transparent windows black on Windows.
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("ChickenWM Files")
             .with_inner_size([1240.0, 760.0])

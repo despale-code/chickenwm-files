@@ -6,6 +6,7 @@
 //! of each command.
 
 mod preview;
+mod tools;
 
 use crate::icons::IconCache;
 use crate::model::{
@@ -93,6 +94,14 @@ enum Action {
     BeginDrag { paths: Vec<PathBuf>, secondary: bool },
     EditAddress,
     FocusSearch,
+    /// Several items: rename them together (find / replace, numbering).
+    BatchRename(Vec<PathBuf>),
+    /// Count these folders' sizes (shown in the Size column).
+    FolderSize(Vec<PathBuf>),
+    DiskUsage(PathBuf),
+    BrowseArchive(PathBuf),
+    GoAnywhere,
+    Undo,
 }
 
 /// Colors and metrics from `files.css`.
@@ -250,6 +259,8 @@ struct DriveInfo {
 #[derive(Default)]
 struct Preview {
     path: Option<PathBuf>,
+    pending: Option<(Entry, Instant)>,
+    cancel: Arc<AtomicBool>,
     text: String,
     image: Option<(egui::TextureHandle, [usize; 2])>,
     loading_image: bool,
@@ -311,6 +322,8 @@ pub struct FilesApp {
     fav_rename: Option<(PathBuf, String, bool)>,
     /// Sidebar sections the user folded away.
     sidebar_collapsed: std::collections::HashSet<&'static str>,
+    /// Batch rename, disk usage, archives, git badges, go-anywhere, undo.
+    tools: tools::Tools,
 }
 
 fn hwnd_of(frame: &eframe::Frame) -> Option<HWND> {
@@ -492,6 +505,7 @@ impl FilesApp {
             fav_drag: None,
             fav_rename: None,
             sidebar_collapsed: Default::default(),
+            tools: Default::default(),
         };
         app.refresh_drives();
         app
@@ -632,6 +646,9 @@ impl FilesApp {
             Action::Open(side, path) => {
                 if path.is_dir() {
                     self.pane_mut(side).navigate(path, &prefs);
+                } else if tools::is_browsable_archive(&display_name(&path)) {
+                    // Archives open like folders (in a browser window).
+                    self.tools.archive = Some(tools::ArchiveView::open(path));
                 } else {
                     shell::shell_open(self.hwnd, &path, None);
                 }
@@ -677,6 +694,7 @@ impl FilesApp {
                     if cut && files.iter().all(|f| f.parent() == Some(dest.as_path())) {
                         return; // moving into the folder it's already in
                     }
+                    self.record_transfer(op, &files, &dest);
                     self.file_job(op, files, Some(dest), cut);
                 }
                 _ => self.toast("Nothing to paste", false),
@@ -789,11 +807,15 @@ impl FilesApp {
                     return;
                 }
                 match kind {
-                    DropKind::Copy => self.file_job(FileOp::Copy, sources, Some(dest), false),
+                    DropKind::Copy => {
+                        self.record_transfer(FileOp::Copy, &sources, &dest);
+                        self.file_job(FileOp::Copy, sources, Some(dest), false)
+                    }
                     DropKind::Move => {
                         if sources.iter().all(|s| s.parent() == Some(dest.as_path())) {
                             return;
                         }
+                        self.record_transfer(FileOp::Move, &sources, &dest);
                         self.file_job(FileOp::Move, sources, Some(dest), false)
                     }
                     DropKind::Shortcut => {
@@ -889,11 +911,23 @@ impl FilesApp {
                 self.address = Some(self.pane(self.focused()).cwd.display().to_string());
             }
             Action::FocusSearch => self.focus_search = true,
+            Action::BatchRename(paths) if paths.len() > 1 => self.tools.batch = Some(tools::BatchRename::new(paths)),
+            Action::BatchRename(paths) => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.apply(Action::StartRename(p));
+                }
+            }
+            Action::FolderSize(dirs) => self.compute_folder_sizes(dirs),
+            Action::DiskUsage(dir) => self.tools.usage = Some(tools::DiskUsage::start(dir, &self.ctx)),
+            Action::BrowseArchive(path) => self.tools.archive = Some(tools::ArchiveView::open(path)),
+            Action::GoAnywhere => self.open_go_anywhere(),
+            Action::Undo => self.undo(),
         }
     }
 
     /// New folder / file: show it selected and start renaming, like Explorer.
     fn after_create(&mut self, path: PathBuf) {
+        self.push_undo(tools::UndoOp::Created(vec![path.clone()]));
         let side = self.focused();
         let prefs = self.prefs.clone();
         let pane = self.pane_mut(side);
@@ -921,6 +955,7 @@ impl FilesApp {
         }
         match std::fs::rename(&r.path, &target) {
             Ok(()) => {
+                self.push_undo(tools::UndoOp::Rename(vec![(r.path.clone(), target.clone())]));
                 let side = self.focused();
                 let prefs = self.prefs.clone();
                 let pane = self.pane_mut(side);
@@ -964,7 +999,7 @@ impl FilesApp {
         let paste_edge = paste_now && !self.paste_down;
         self.paste_down = paste_now;
 
-        if ctx.wants_keyboard_input() || self.rename.is_some() || self.address.is_some() || self.fav_rename.is_some() {
+        if ctx.wants_keyboard_input() || self.rename.is_some() || self.address.is_some() || self.fav_rename.is_some() || self.tool_window_open() {
             return;
         }
         let side = self.focused();
@@ -1042,9 +1077,17 @@ impl FilesApp {
             }
             // Commands
             if pressed(egui::Key::F2) {
-                if let Some(e) = &current {
+                if targets.len() > 1 {
+                    actions.push(Action::BatchRename(targets.clone()));
+                } else if let Some(e) = &current {
                     actions.push(Action::StartRename(e.path.clone()));
                 }
+            }
+            if m.ctrl && pressed(egui::Key::Z) {
+                actions.push(Action::Undo);
+            }
+            if m.ctrl && pressed(egui::Key::P) {
+                actions.push(Action::GoAnywhere);
             }
             if pressed(egui::Key::Delete) {
                 actions.push(if m.shift { Action::Delete(targets.clone()) } else { Action::Recycle(targets.clone()) });
@@ -1188,23 +1231,96 @@ impl FilesApp {
         let current = self.pane(self.focused()).current().cloned();
         let path = current.as_ref().map(|e| e.path.clone());
         if path == self.preview.path {
+            self.preview.pending = None;
             return;
         }
-        self.preview = Preview { path: path.clone(), ..Default::default() };
-        let Some(entry) = current else { return };
+        let Some(entry) = current else {
+            self.preview.cancel.store(true, Ordering::Relaxed);
+            self.preview = Preview::default();
+            return;
+        };
+
+        // Lazy load & cancel on fast scrolling: debounce rapid cursor movement by 75ms
+        if self.preview.path.is_some() {
+            let pending_same = self
+                .preview
+                .pending
+                .as_ref()
+                .is_some_and(|(e, _)| e.path == entry.path);
+            if !pending_same {
+                self.preview.cancel.store(true, Ordering::Relaxed);
+                self.preview.pending = Some((entry, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(80));
+                return;
+            }
+            if let Some((_, since)) = &self.preview.pending {
+                if since.elapsed() < Duration::from_millis(75) {
+                    ctx.request_repaint_after(Duration::from_millis(40));
+                    return;
+                }
+            }
+        }
+
+        self.preview.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview = Preview {
+            path: Some(entry.path.clone()),
+            cancel: Arc::clone(&cancel),
+            ..Default::default()
+        };
+
         if !entry.is_dir && is_image(&entry.path) && entry.size < 60 * 1024 * 1024 {
             self.preview.loading_image = true;
             self.preview.kind = preview::Kind::Image;
             let tx = self.image_tx.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let decoded = image::open(&entry.path).ok().map(|img| {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let decoded = image::open(&entry.path).ok().and_then(|img| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     let dims = [img.width() as usize, img.height() as usize];
                     let thumb = img.thumbnail(640, 640).to_rgba8();
                     let size = [thumb.width() as usize, thumb.height() as usize];
-                    (egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()), dims)
+                    Some((egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()), dims))
                 });
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 let (img, dims) = match decoded {
+                    Some((i, d)) => (Some(i), d),
+                    None => (None, [0, 0]),
+                };
+                let _ = tx.send((entry.path, img, dims));
+                ctx.request_repaint();
+            });
+        } else if !entry.is_dir && (is_archive(&entry.name) || tools::is_browsable_archive(&entry.name)) {
+            self.preview.text = preview::archive_preview_text(&entry, &cancel);
+            self.preview.kind = preview::Kind::Folder;
+        } else if !entry.is_dir && (preview::is_pdf(&entry.path) || preview::is_audio_video(&entry.path)) {
+            let is_pdf_file = preview::is_pdf(&entry.path);
+            self.preview.kind = if is_pdf_file {
+                preview::Kind::Pdf
+            } else {
+                preview::Kind::Media
+            };
+            self.preview.text = if is_pdf_file {
+                preview::pdf_preview_text(&entry, &cancel)
+            } else {
+                preview::media_preview_text(&entry)
+            };
+            self.preview.loading_image = true;
+            let tx = self.image_tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let thumb = preview::extract_or_synthesize_thumbnail(&entry, &cancel);
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let (img, dims) = match thumb {
                     Some((i, d)) => (Some(i), d),
                     None => (None, [0, 0]),
                 };
@@ -1231,6 +1347,8 @@ struct Draw<'a> {
     dragging: bool,
     focused: bool,
     actions: &'a mut Vec<Action>,
+    /// Folder sizes and git badges for this frame.
+    extras: &'a tools::RowExtras,
 }
 
 fn paint_icon(ui: &egui::Ui, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
@@ -1291,6 +1409,10 @@ fn item_menu(ui: &mut egui::Ui, side: Side, entry: &Entry, targets: &[PathBuf], 
             item(ui, "Run as administrator", "", Action::RunAsAdmin(entry.path.clone()));
         }
     }
+    if single && tools::is_browsable_archive(&entry.name) {
+        ui.separator();
+        item(ui, "Browse archive", "", Action::BrowseArchive(entry.path.clone()));
+    }
     if single && is_archive(&entry.name) {
         ui.separator();
         item(ui, "Extract here", "", Action::Extract { archive: entry.path.clone(), into_folder: false });
@@ -1307,6 +1429,8 @@ fn item_menu(ui: &mut egui::Ui, side: Side, entry: &Entry, targets: &[PathBuf], 
     ui.separator();
     if single {
         item(ui, "Rename", "F2", Action::StartRename(entry.path.clone()));
+    } else {
+        item(ui, &format!("Rename {} items…", targets.len()), "F2", Action::BatchRename(t()));
     }
     item(ui, "Delete", "Del", Action::Recycle(t()));
     item(ui, "Delete permanently", "Shift+Del", Action::Delete(t()));
@@ -1320,6 +1444,12 @@ fn item_menu(ui: &mut egui::Ui, side: Side, entry: &Entry, targets: &[PathBuf], 
             item(ui, "Add to Favorites", "", Action::Pin(entry.path.clone()));
         }
         item(ui, "Open in Terminal", "", Action::Terminal(entry.path.clone()));
+    }
+    if targets.iter().any(|p| p.is_dir()) {
+        item(ui, "Calculate size", "", Action::FolderSize(t()));
+    }
+    if entry.is_dir && single {
+        item(ui, "Disk usage…", "", Action::DiskUsage(entry.path.clone()));
     }
     ui.separator();
     item(ui, "Show more options", "", Action::NativeMenu(t()));
@@ -1383,6 +1513,15 @@ fn background_menu(ui: &mut egui::Ui, side: Side, cwd: &Path, prefs: &Prefs, pin
     ui.separator();
     if ui.button("Open in Terminal").clicked() {
         push(ui, Action::Terminal(cwd.to_path_buf()));
+    }
+    if ui.button("Disk usage…").clicked() {
+        push(ui, Action::DiskUsage(cwd.to_path_buf()));
+    }
+    if ui.add(egui::Button::new("Go to folder…").shortcut_text("Ctrl+P")).clicked() {
+        push(ui, Action::GoAnywhere);
+    }
+    if ui.add(egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+        push(ui, Action::Undo);
     }
     if ui.button(if pinned { "Remove from Favorites" } else { "Add to Favorites" }).clicked() {
         push(ui, if pinned { Action::Unpin(cwd.to_path_buf()) } else { Action::Pin(cwd.to_path_buf()) });
@@ -1597,8 +1736,17 @@ impl Draw<'_> {
                         .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, type_label(self.icons, entry), small.clone(), th.dim);
                     cx += type_w;
                 }
-                if !entry.is_dir {
-                    ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, format_bytes(entry.size), small, th.dim);
+                let size_text = if entry.is_dir {
+                    self.extras.sizes.get(&entry.path).map(|s| s.map(format_bytes).unwrap_or_else(|| "…".to_owned()))
+                } else {
+                    Some(format_bytes(entry.size))
+                };
+                if let Some(text) = size_text {
+                    ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, text, small.clone(), th.dim);
+                }
+                if let Some(&letter) = self.extras.git.get(&entry.path) {
+                    let at = Pos2::new(name_rect.right() - 4.0, rect.center().y);
+                    ui.painter().text(at, Align2::RIGHT_CENTER, letter.to_string(), small, tools::git_badge_color(letter, &th));
                 }
                 self.interact(&resp, side, pos, entry, pane, rect, dual);
             }
@@ -1731,7 +1879,9 @@ impl eframe::App for FilesApp {
         self.draw_top(ctx, theme, &mut actions);
         self.draw_status(ctx, theme);
         self.draw_sidebar(ctx, theme, &mut actions);
-        self.draw_center(ctx, theme, &mut actions, &mut commit_rename);        self.handle_drag_and_drop(ctx, theme, &mut actions);
+        self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
+        self.draw_tools(ctx, theme);
+        self.handle_drag_and_drop(ctx, theme, &mut actions);
 
         for a in actions {
             self.apply(a);
@@ -2027,6 +2177,8 @@ impl FilesApp {
 
                 let running = self.jobs.running.load(Ordering::Relaxed);
                 let status = self.jobs.status.lock().clone();
+                let counting_folders = !self.tools.folder_size_stops.lock().is_empty();
+                let mut cancel_folders = false;
                 if running > 0 {
                     ui.separator();
                     match *self.jobs.progress.lock() {
@@ -2038,6 +2190,13 @@ impl FilesApp {
                             ui.label(status);
                         }
                     }
+                } else if counting_folders {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Calculating folder sizes…").color(th.dim));
+                    if ui.small_button("Cancel").clicked() {
+                        cancel_folders = true;
+                    }
                 } else if let Some((msg, at, error)) = &self.toast {
                     if at.elapsed() < Duration::from_secs(4) {
                         ui.separator();
@@ -2047,6 +2206,9 @@ impl FilesApp {
                 } else if !status.is_empty() {
                     ui.separator();
                     ui.label(egui::RichText::new(status).color(th.dim));
+                }
+                if cancel_folders {
+                    self.cancel_folder_sizes();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2375,6 +2537,10 @@ impl FilesApp {
                 }
             }
             let child_entries = std::mem::take(&mut self.child_cache.1);
+            let extras = tools::RowExtras {
+                sizes: self.tools.folder_sizes.lock().clone(),
+                git: self.tools.git.status.lock().clone(),
+            };
             let preview = &self.preview;
             let mut draw = Draw {
                 theme: th,
@@ -2386,6 +2552,7 @@ impl FilesApp {
                 dragging,
                 focused: true,
                 actions,
+                extras: &extras,
             };
             let pane_frame = |focused: bool| {
                 egui::Frame::NONE

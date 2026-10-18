@@ -1,9 +1,12 @@
-//! Preview content: images, highlighted code and text, drawn in a card that fills the space it
-//! is given, with everything centered.
+//! Preview content: images, archives, PDFs, audio/video thumbnails, highlighted code and text,
+//! drawn in a card that fills the space it is given, with everything centered.
 
 use super::{Preview, Theme};
-use crate::model::Entry;
+use crate::model::{format_bytes, is_archive, Entry};
 use eframe::egui::{self, text::LayoutJob, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, TextFormat, Vec2};
+use std::io::Read;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What the preview holds, decided when the selection changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,10 +18,32 @@ pub(super) enum Kind {
     Code(&'static str),
     /// Prose / plain text, wrapped.
     Text,
-    /// Folder listing.
+    /// Folder or archive listing.
     Folder,
-    /// A one-line note (binary file, archive, unreadable…), shown centered.
+    /// PDF document preview.
+    Pdf,
+    /// Audio or video file preview.
+    Media,
+    /// A one-line note (binary file, unreadable…), shown centered.
     Message,
+}
+
+pub(super) fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+pub(super) fn is_audio_video(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus" | "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv"
+    )
 }
 
 /// Language label and comment syntax for a file extension.
@@ -66,12 +91,18 @@ struct Comments {
 }
 
 pub(super) fn classify(entry: &Entry, text: &str) -> Kind {
-    if entry.is_dir {
+    if entry.is_dir || is_archive(&entry.name) || super::tools::is_browsable_archive(&entry.name) {
         return Kind::Folder;
     }
+    if is_pdf(&entry.path) {
+        return Kind::Pdf;
+    }
+    if is_audio_video(&entry.path) {
+        return Kind::Media;
+    }
     let ext = entry.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    // Short notes from `text_preview` (binary, archive, unreadable) have no real content.
-    if text.starts_with("Binary file · ") || text.starts_with("Archive · ") || text == "Can't read this file." {
+    // Short notes from `text_preview` (binary, unreadable) have no real content.
+    if text.starts_with("Binary file · ") || text == "Can't read this file." {
         return Kind::Message;
     }
     if let Some((name, _)) = language(&ext) {
@@ -81,6 +112,181 @@ pub(super) fn classify(entry: &Entry, text: &str) -> Kind {
         return Kind::Message;
     }
     Kind::Text
+}
+
+/// Builds a folder-style listing for an archive (.zip, .tar, .7z, .rar, etc.).
+pub(super) fn archive_preview_text(entry: &Entry, cancel: &AtomicBool) -> String {
+    if cancel.load(Ordering::Relaxed) {
+        return String::new();
+    }
+    match super::tools::list_archive(&entry.path) {
+        Ok(items) => {
+            let mut s = format!("Archive · {} items ({})\n\n", items.len(), format_bytes(entry.size));
+            for item in items.iter().take(80) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if item.is_dir {
+                    s.push_str("📁 ");
+                    s.push_str(&item.path);
+                } else {
+                    s.push_str("    ");
+                    s.push_str(&item.path);
+                    if let Some(sz) = item.size {
+                        s.push_str(&format!("  ({})", format_bytes(sz)));
+                    }
+                }
+                s.push('\n');
+            }
+            s
+        }
+        Err(_) => format!("Archive · {}\n\nRight-click → Extract to open it.", format_bytes(entry.size)),
+    }
+}
+
+/// Extracts page count, metadata, and readable text snippets from a PDF file.
+pub(super) fn pdf_preview_text(entry: &Entry, cancel: &AtomicBool) -> String {
+    let Ok(mut f) = std::fs::File::open(&entry.path) else {
+        return format!("PDF Document · {}", format_bytes(entry.size));
+    };
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    if cancel.load(Ordering::Relaxed) {
+        return String::new();
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let pages = raw.matches("/Type /Page").count().saturating_sub(raw.matches("/Type /Pages").count()).max(1);
+    let mut lines = vec![format!("PDF Document · ~{pages} page(s) · {}", format_bytes(entry.size))];
+    for tag in ["/Title", "/Author", "/Subject"] {
+        if let Some(pos) = raw.find(tag) {
+            let after = &raw[pos + tag.len()..];
+            if let Some(open) = after.find('(') {
+                if let Some(close) = after[open + 1..].find(')') {
+                    let val = after[open + 1..open + 1 + close].trim();
+                    if !val.is_empty() && val.chars().all(|c| !c.is_control()) {
+                        lines.push(format!("{}: {val}", &tag[1..]));
+                    }
+                }
+            }
+        }
+    }
+    lines.push(String::new());
+    // Extract readable ASCII text literals inside BT ... ET blocks
+    let mut snippets = Vec::new();
+    let mut rest = raw.as_ref();
+    while let Some(bt) = rest.find("BT") {
+        let after_bt = &rest[bt + 2..];
+        let Some(et) = after_bt.find("ET") else { break };
+        let block = &after_bt[..et];
+        let mut b_rest = block;
+        while let Some(o) = b_rest.find('(') {
+            let after_o = &b_rest[o + 1..];
+            let Some(c) = after_o.find(')') else { break };
+            let lit = after_o[..c].trim();
+            if lit.len() >= 3 && lit.chars().all(|ch| ch.is_ascii_graphic() || ch == ' ') {
+                snippets.push(lit.to_owned());
+            }
+            b_rest = &after_o[c + 1..];
+        }
+        if snippets.len() >= 24 {
+            break;
+        }
+        rest = &after_bt[et + 2..];
+    }
+    if !snippets.is_empty() {
+        lines.push(snippets.join(" "));
+    }
+    lines.join("\n")
+}
+
+/// Extracts metadata summary for audio/video files.
+pub(super) fn media_preview_text(entry: &Entry) -> String {
+    let ext = entry.ext.to_ascii_uppercase();
+    let is_audio = matches!(
+        entry.ext.to_ascii_lowercase().as_str(),
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus"
+    );
+    let kind = if is_audio { "Audio" } else { "Video" };
+    format!("{kind} ({ext}) · {}", format_bytes(entry.size))
+}
+
+/// Extracts an embedded JPEG/PNG thumbnail from a media or PDF file, or synthesizes a clean
+/// visual thumbnail card if none is embedded.
+pub(super) fn extract_or_synthesize_thumbnail(
+    entry: &Entry,
+    cancel: &AtomicBool,
+) -> Option<(egui::ColorImage, [usize; 2])> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    if let Ok(mut f) = std::fs::File::open(&entry.path) {
+        let mut buf = vec![0u8; 2 * 1024 * 1024];
+        let n = f.read(&mut buf).unwrap_or(0);
+        buf.truncate(n);
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Look for embedded PNG (`\x89PNG\r\n\x1a\n` .. `IEND`)
+        if let Some(start) = buf.windows(8).position(|w| w == b"\x89PNG\r\n\x1a\n") {
+            if let Some(end_rel) = buf[start..].windows(4).position(|w| w == b"IEND") {
+                let end = (start + end_rel + 8).min(buf.len());
+                if let Ok(img) = image::load_from_memory(&buf[start..end]) {
+                    let dims = [img.width() as usize, img.height() as usize];
+                    let thumb = img.thumbnail(480, 480).to_rgba8();
+                    let size = [thumb.width() as usize, thumb.height() as usize];
+                    return Some((egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()), dims));
+                }
+            }
+        }
+        // Look for embedded JPEG (`\xFF\xD8\xFF` .. `\xFF\xD9`)
+        let mut search = 0;
+        while search + 4 < buf.len() {
+            let Some(rel) = buf[search..].windows(3).position(|w| w == [0xFF, 0xD8, 0xFF]) else {
+                break;
+            };
+            let start = search + rel;
+            if let Some(end_rel) = buf[start + 3..].windows(2).position(|w| w == [0xFF, 0xD9]) {
+                let end = start + 3 + end_rel + 2;
+                if end - start > 512 {
+                    if let Ok(img) = image::load_from_memory(&buf[start..end]) {
+                        let dims = [img.width() as usize, img.height() as usize];
+                        let thumb = img.thumbnail(480, 480).to_rgba8();
+                        let size = [thumb.width() as usize, thumb.height() as usize];
+                        return Some((egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()), dims));
+                    }
+                }
+            }
+            search = start + 3;
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    // Synthesize a clean thumbnail card if no embedded cover art/thumbnail exists
+    let (w, h) = (240usize, 180usize);
+    let mut pixels = vec![Color32::from_rgb(36, 40, 56); w * h];
+    let is_pdf_file = is_pdf(&entry.path);
+    let accent = if is_pdf_file {
+        [225u8, 85, 95]
+    } else {
+        [110u8, 155, 245]
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let border = x < 2 || x + 2 >= w || y < 2 || y + 2 >= h;
+            let bar = !is_pdf_file && (y > h / 2 - 24 && y < h / 2 + 24) && ((x / 8) % 2 == 0)
+                && {
+                    let wave = (((x as f32 * 0.17).sin().abs() * 20.0) as usize).max(4);
+                    y.abs_diff(h / 2) <= wave
+                };
+            let page_line = is_pdf_file && x >= 44 && x < w - 44 && y >= 28 && y < h - 28 && (y % 14 < 3);
+            if border || bar || page_line {
+                pixels[y * w + x] = Color32::from_rgb(accent[0], accent[1], accent[2]);
+            }
+        }
+    }
+    Some((egui::ColorImage { size: [w, h], pixels }, [w, h]))
 }
 
 /// Draws the preview card over all of the space left in `ui`.
@@ -94,13 +300,33 @@ pub(super) fn body(ui: &mut egui::Ui, th: &Theme, preview: &Preview, salt: &str)
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Center)));
     let ui = &mut child;
 
-    if preview.loading_image {
+    if preview.loading_image && preview.image.is_none() && preview.text.is_empty() {
         centered(ui, inner, |ui| {
             ui.spinner();
         });
         return;
     }
     if let Some((tex, dims)) = &preview.image {
+        if matches!(preview.kind, Kind::Pdf | Kind::Media) && !preview.text.is_empty() {
+            let size = tex.size_vec2();
+            let scale = (inner.width() / size.x).min(140.0 / size.y).min(1.5);
+            let img_size = size * scale;
+            let (img_rect, _) = ui.allocate_exact_size(img_size, Sense::hover());
+            egui::Image::new(tex).corner_radius(CornerRadius::same(6)).paint_at(ui, img_rect);
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(preview.text.trim_end())
+                            .size(th.font - 0.5)
+                            .color(th.fg)
+                            .line_height(Some(th.font * 1.4)),
+                    )
+                    .wrap(),
+                );
+            });
+            return;
+        }
         // Fit inside the card (small images may grow up to 2×), centered, caption below.
         let caption_h = 22.0;
         let size = tex.size_vec2();
@@ -130,8 +356,13 @@ pub(super) fn body(ui: &mut egui::Ui, th: &Theme, preview: &Preview, salt: &str)
             ui.label(egui::RichText::new(preview.text.trim()).color(th.dim));
         }),
         Kind::Folder => folder(ui, th, &preview.text, salt),
-        Kind::Text => {
-            header(ui, th, "Text", line_count(&preview.text));
+        Kind::Pdf | Kind::Media | Kind::Text => {
+            let label = match preview.kind {
+                Kind::Pdf => "PDF",
+                Kind::Media => "Media",
+                _ => "Text",
+            };
+            header(ui, th, label, line_count(&preview.text));
             egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show(ui, |ui| {
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     ui.add(
