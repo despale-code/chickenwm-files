@@ -930,6 +930,8 @@ pub(super) struct Git {
     pub cwd: Option<PathBuf>,
     /// Absolute path → status letter (M, A, D, R, ?, U, and • for folders containing changes).
     pub status: Arc<Mutex<HashMap<PathBuf, char>>>,
+    pub branch: Arc<Mutex<Option<String>>>,
+    pub summary: Arc<Mutex<Option<String>>>,
     pub fetched: Option<Instant>,
     pub busy: Arc<AtomicBool>,
 }
@@ -974,10 +976,19 @@ impl FilesApp {
         }
         if !same {
             git.status.lock().clear();
+            *git.branch.lock() = None;
+            *git.summary.lock() = None;
         }
         git.cwd = Some(cwd.to_path_buf());
         git.fetched = Some(Instant::now());
-        let (status, busy, ctx, cwd) = (git.status.clone(), git.busy.clone(), self.ctx.clone(), cwd.to_path_buf());
+        let (status, branch, summary, busy, ctx, cwd) = (
+            git.status.clone(),
+            git.branch.clone(),
+            git.summary.clone(),
+            git.busy.clone(),
+            self.ctx.clone(),
+            cwd.to_path_buf(),
+        );
         std::thread::spawn(move || {
             use std::os::windows::process::CommandExt;
             let run = |args: &[&str]| {
@@ -991,10 +1002,20 @@ impl FilesApp {
                     .filter(|o| o.status.success())
             };
             let mut map = HashMap::new();
+            let mut branch_name = None;
+            let mut mod_count = 0;
+            let mut untracked_count = 0;
             if let Some(top) = run(&["rev-parse", "--show-toplevel"]) {
+                branch_name = run(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
                 let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim().replace('/', "\\"));
                 if let Some(out) = run(&["status", "--porcelain=v1", "-z", "--untracked-files=normal"]) {
                     for (rel, letter) in parse_porcelain(&String::from_utf8_lossy(&out.stdout)) {
+                        match letter {
+                            '?' => untracked_count += 1,
+                            '•' => {}
+                            _ => mod_count += 1,
+                        }
                         let abs = top.join(rel.replace('/', "\\"));
                         // Folders on the way show that something inside changed.
                         let mut p = abs.parent();
@@ -1010,6 +1031,20 @@ impl FilesApp {
                 }
             }
             *status.lock() = map;
+            *branch.lock() = branch_name;
+            let summary_str = if mod_count > 0 || untracked_count > 0 {
+                let mut parts = Vec::new();
+                if mod_count > 0 {
+                    parts.push(format!("{mod_count} modified"));
+                }
+                if untracked_count > 0 {
+                    parts.push(format!("{untracked_count} untracked"));
+                }
+                Some(parts.join(", "))
+            } else {
+                None
+            };
+            *summary.lock() = summary_str;
             busy.store(false, Ordering::SeqCst);
             ctx.request_repaint();
         });
