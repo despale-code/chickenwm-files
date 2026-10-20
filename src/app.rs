@@ -3314,43 +3314,43 @@ fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
         ViewMode::Dual => (paint_view_dual, "Dual"),
     };
 
-    let frame = egui::Frame::NONE
+    let label = format!("     {title}   ");
+    let btn = egui::Button::new(egui::RichText::new(label).size(th.font - 0.5).color(th.fg))
         .fill(th.pane)
-        .corner_radius(CornerRadius::same(th.radius.min(6)))
         .stroke(Stroke::new(1.0_f32, th.hairline()))
-        .inner_margin(egui::Margin::symmetric(4, 2));
+        .corner_radius(CornerRadius::same(th.radius.min(6)))
+        .min_size(egui::vec2(0.0, 28.0));
 
-    frame.show(ui, |ui| {
-        let label = format!("     {title}   ");
-        let menu_resp = ui.menu_button(egui::RichText::new(label).size(th.font - 1.0).color(th.fg), |ui| {
-            ui.set_min_width(190.0);
-            let items = [
-                (ViewMode::Details, "List", "Ctrl+Shift+1", paint_view_list as fn(&egui::Painter, Rect, Color32)),
-                (ViewMode::Icons, "Icons", "Ctrl+Shift+2", paint_view_icons),
-                (ViewMode::Columns, "Columns", "Ctrl+Shift+3", paint_view_columns),
-                (ViewMode::Dual, "Dual", "Ctrl+Shift+4", paint_view_dual),
-            ];
-            for (vm, name, sc, p_icon) in items {
-                let active = vm == current;
-                let (r, resp) = ui.allocate_exact_size(egui::vec2(190.0, 24.0), Sense::click());
-                if resp.hovered() || active {
-                    ui.painter().rect_filled(r, CornerRadius::same(4), if active { th.accent.gamma_multiply(0.18) } else { th.fg.gamma_multiply(0.06) });
-                }
-                let ic_r = Rect::from_min_size(r.min + egui::vec2(8.0, 4.0), egui::vec2(16.0, 16.0));
-                p_icon(ui.painter(), ic_r, if active { th.accent } else { th.fg });
-                ui.painter().text(r.min + egui::vec2(30.0, 12.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 0.5), if active { th.accent } else { th.fg });
-                ui.painter().text(r.max - egui::vec2(10.0, 12.0), Align2::RIGHT_CENTER, sc, FontId::proportional(th.font - 2.5), th.dim);
-                if resp.clicked() {
-                    picked = Some(vm);
-                    ui.close_menu();
-                }
+    let menu_resp = egui::menu::menu_custom_button(ui, btn, |ui| {
+        ui.set_min_width(190.0);
+        let items = [
+            (ViewMode::Details, "List", "Ctrl+Shift+1", paint_view_list as fn(&egui::Painter, Rect, Color32)),
+            (ViewMode::Icons, "Icons", "Ctrl+Shift+2", paint_view_icons),
+            (ViewMode::Columns, "Columns", "Ctrl+Shift+3", paint_view_columns),
+            (ViewMode::Dual, "Dual", "Ctrl+Shift+4", paint_view_dual),
+        ];
+        for (vm, name, sc, p_icon) in items {
+            let active = vm == current;
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(190.0, 24.0), Sense::click());
+            if resp.hovered() || active {
+                ui.painter().rect_filled(r, CornerRadius::same(4), if active { th.accent.gamma_multiply(0.18) } else { th.fg.gamma_multiply(0.06) });
             }
-        });
-        let icon_rect = Rect::from_min_size(menu_resp.response.rect.min + egui::vec2(6.0, 4.0), egui::vec2(16.0, 16.0));
-        icon_fn(ui.painter(), icon_rect, if menu_resp.response.hovered() { th.accent } else { th.fg });
-        let chev_rect = Rect::from_min_size(menu_resp.response.rect.max - egui::vec2(14.0, 18.0), egui::vec2(10.0, 12.0));
-        paint_chevron_down(ui.painter(), chev_rect, if menu_resp.response.hovered() { th.accent } else { th.dim });
+            let ic_r = Rect::from_min_size(r.min + egui::vec2(8.0, 4.0), egui::vec2(16.0, 16.0));
+            p_icon(ui.painter(), ic_r, if active { th.accent } else { th.fg });
+            ui.painter().text(r.min + egui::vec2(30.0, 12.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 0.5), if active { th.accent } else { th.fg });
+            ui.painter().text(r.max - egui::vec2(10.0, 12.0), Align2::RIGHT_CENTER, sc, FontId::proportional(th.font - 2.5), th.dim);
+            if resp.clicked() {
+                picked = Some(vm);
+                ui.close_menu();
+            }
+        }
     });
+
+    let rect = menu_resp.response.rect;
+    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 14.0, rect.center().y), Vec2::splat(14.0));
+    icon_fn(ui.painter(), icon_rect, if menu_resp.response.hovered() { th.accent } else { th.fg });
+    let chev_rect = Rect::from_center_size(Pos2::new(rect.right() - 11.0, rect.center().y), Vec2::new(8.0, 10.0));
+    paint_chevron_down(ui.painter(), chev_rect, if menu_resp.response.hovered() { th.accent } else { th.dim });
 
     picked
 }
