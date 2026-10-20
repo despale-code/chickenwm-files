@@ -141,13 +141,15 @@ impl Theme {
     }
     fn from_css(sheet: &CssStyleSheet) -> Self {
         let fg = c(sheet.var_color("--fg-color", rgb(205, 214, 244)));
+        let subtext = c(sheet.var_color("--subtext-color", rgb(174, 174, 163)));
+        let dim = if subtext != fg { subtext } else { fg.gamma_multiply(0.65) };
         let accent = c(sheet.var_color("--accent-color", rgb(51, 204, 255)));
         Self {
             bg: c(sheet.var_color("--bg-color", rgb(24, 24, 37))),
             pane: c(sheet.var_color("--pane-bg", rgb(30, 30, 46))),
             sidebar: c(sheet.var_color("--sidebar-bg", rgb(17, 17, 27))),
             fg,
-            dim: fg.gamma_multiply(0.6),
+            dim,
             dir: c(sheet.var_color("--dir-color", rgb(137, 180, 250))),
             exec: c(sheet.var_color("--exec-color", rgb(166, 227, 161))),
             archive: c(sheet.var_color("--archive-color", rgb(249, 226, 175))),
@@ -174,15 +176,10 @@ impl Theme {
     }
 
     fn name_color(&self, e: &Entry) -> Color32 {
-        if e.is_dir {
-            return self.dir;
-        }
-        match e.ext.to_ascii_lowercase().as_str() {
-            "exe" | "bat" | "cmd" | "ps1" | "msi" | "com" | "lnk" => self.exec,
-            "zip" | "7z" | "rar" | "gz" | "tgz" | "tar" | "xz" | "bz2" => self.archive,
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "mp3" | "flac"
-            | "wav" | "ogg" | "m4a" | "mp4" | "mkv" | "webm" | "mov" | "avi" => self.media,
-            _ => self.fg,
+        if e.hidden {
+            self.dim
+        } else {
+            self.fg
         }
     }
 
@@ -2094,149 +2091,170 @@ impl FilesApp {
                     }
                 });
 
-                ui.add_space(3.0);
+                ui.add_space(4.0);
 
-                // 2. Breadcrumbs / Address bar
-                let search_w = 170.0;
-                let views_w = 230.0;
-                let tools_w = 120.0;
-                let addr_w = (ui.available_width() - search_w - views_w - tools_w - 24.0).max(120.0);
+                // 2. Breadcrumbs / Address bar: compact, fits between nav capsule and right tools
+                let right_needed = 410.0;
+                let addr_w = (ui.available_width() - right_needed).clamp(90.0, 240.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
-                ui.add_space(3.0);
+                // 3. Right-anchored toolbar section (Tools, Views, Search)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
 
-                // 3. Search Box
-                let (filter_text, folder_title) = {
-                    let pane = self.pane(side);
-                    (pane.filter.clone(), pane.title())
-                };
-                let hint = format!("🔍 Search {folder_title}…");
-                let mut filter_buf = filter_text;
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut filter_buf)
-                        .hint_text(hint)
-                        .desired_width(search_w)
-                        .margin(egui::Margin::symmetric(8, 5)),
-                );
-                if self.focus_search {
-                    resp.request_focus();
-                    self.focus_search = false;
-                }
-                if resp.changed() {
-                    let prefs = self.prefs.clone();
-                    let pane = self.pane_mut(side);
-                    pane.filter = filter_buf.clone();
-                    pane.rebuild(&prefs);
-                }
-                if !filter_buf.is_empty() {
-                    if ui.add(egui::Button::new(egui::RichText::new("×").size(th.font)).frame(false)).on_hover_text("Clear search").clicked() {
+                    // Quick Tools: Options Gear, Terminal, Preview
+                    let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
+                    let term_active = self.terminal.open;
+
+                    let tools_frame = egui::Frame::NONE
+                        .fill(th.pane)
+                        .corner_radius(CornerRadius::same(th.radius.min(6)))
+                        .stroke(Stroke::new(1.0_f32, th.hairline()))
+                        .inner_margin(egui::Margin::symmetric(4, 2));
+
+                    tools_frame.show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+
+                        ui.menu_button("⚙", |ui| {
+                            let mut hidden = self.prefs.show_hidden;
+                            if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
+                                actions.push(Action::ToggleHidden);
+                                ui.close_menu();
+                            }
+                            let mut preview = self.prefs.show_preview;
+                            if ui.checkbox(&mut preview, "Preview pane").clicked() {
+                                actions.push(Action::TogglePreview);
+                                ui.close_menu();
+                            }
+                            let mut ext = self.prefs.show_extensions;
+                            if ui.checkbox(&mut ext, "File name extensions").clicked() {
+                                self.prefs.show_extensions = ext;
+                                self.prefs.save();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.label(egui::RichText::new("Appearance").small().color(th.dim));
+                            use chickenwm_core::theme::AppMode;
+                            for (m, label) in [(AppMode::System, "Follow system"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")] {
+                                if ui.radio(self.app_mode == m, label).clicked() {
+                                    self.app_mode = m;
+                                    if let Err(e) = chickenwm_core::theme::set_app_mode("files", m) {
+                                        self.toast(format!("Couldn't change appearance: {e}"), true);
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Dual pane  (F3 / Ctrl+D)").clicked() {
+                                actions.push(Action::ToggleDualPane);
+                                ui.close_menu();
+                            }
+                            if ui.button("Embedded terminal  (Ctrl+`)").clicked() {
+                                actions.push(Action::ToggleTerminal);
+                                ui.close_menu();
+                            }
+                            if ui.button("Undo  (Ctrl+Z)").clicked() {
+                                actions.push(Action::Undo);
+                                ui.close_menu();
+                            }
+                            if ui.button("Go anywhere…  (Ctrl+P)").clicked() {
+                                actions.push(Action::GoAnywhere);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("New folder  (Ctrl+Shift+N)").clicked() {
+                                actions.push(Action::NewFolder(self.pane(side).cwd.clone()));
+                                ui.close_menu();
+                            }
+                            if ui.button("Open in External Terminal").clicked() {
+                                actions.push(Action::Terminal(self.pane(side).cwd.clone()));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
+                        });
+
+                        let term_btn = egui::Button::new(
+                            egui::RichText::new("").size(th.font).color(if term_active { th.accent } else { th.dim })
+                        )
+                        .fill(if term_active { th.accent.gamma_multiply(0.18) } else { Color32::TRANSPARENT })
+                        .frame(false)
+                        .min_size(egui::vec2(22.0, 24.0));
+                        if ui.add(term_btn).on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)").clicked() {
+                            actions.push(Action::ToggleTerminal);
+                        }
+
+                        let prev_btn = egui::Button::new(
+                            egui::RichText::new("◨").size(th.font + 1.0).color(if preview_active { th.accent } else { th.dim })
+                        )
+                        .fill(if preview_active { th.accent.gamma_multiply(0.18) } else { Color32::TRANSPARENT })
+                        .frame(false)
+                        .min_size(egui::vec2(22.0, 24.0));
+                        if ui.add(prev_btn).on_hover_text("Toggle Preview pane").clicked() {
+                            actions.push(Action::TogglePreview);
+                        }
+                    });
+
+                    // View Mode Switcher
+                    if let Some(v) = view_segments(ui, th, self.prefs.view) {
+                        actions.push(Action::SetView(v));
+                    }
+
+                    // Search Box
+                    let (filter_text, folder_title) = {
+                        let pane = self.pane(side);
+                        (pane.filter.clone(), pane.title())
+                    };
+                    let hint = format!("🔍 Search {folder_title}…");
+                    let mut filter_buf = filter_text;
+
+                    let (resp, clear_clicked) = {
+                        let search_frame = egui::Frame::NONE
+                            .fill(th.pane)
+                            .corner_radius(CornerRadius::same(th.radius.min(6)))
+                            .stroke(Stroke::new(1.0_f32, th.hairline()))
+                            .inner_margin(egui::Margin::symmetric(6, 2));
+
+                        search_frame.show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let clear_btn = if !filter_buf.is_empty() {
+                                ui.add(egui::Button::new(egui::RichText::new("×").size(th.font)).frame(false)).on_hover_text("Clear search").clicked()
+                            } else {
+                                false
+                            };
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut filter_buf)
+                                    .hint_text(hint)
+                                    .desired_width(120.0)
+                                    .frame(false)
+                                    .margin(egui::Margin::symmetric(4, 2)),
+                            );
+                            (resp, clear_btn)
+                        }).inner
+                    };
+                    if self.focus_search {
+                        resp.request_focus();
+                        self.focus_search = false;
+                    }
+                    if resp.changed() {
+                        let prefs = self.prefs.clone();
+                        let pane = self.pane_mut(side);
+                        pane.filter = filter_buf.clone();
+                        pane.rebuild(&prefs);
+                    }
+                    if clear_clicked {
                         let prefs = self.prefs.clone();
                         let pane = self.pane_mut(side);
                         pane.filter.clear();
                         pane.rebuild(&prefs);
                     }
-                }
-                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    let prefs = self.prefs.clone();
-                    let pane = self.pane_mut(side);
-                    pane.filter.clear();
-                    pane.rebuild(&prefs);
-                    resp.surrender_focus();
-                }
-
-                ui.add_space(3.0);
-
-                // 4. View Mode Switcher
-                if let Some(v) = view_segments(ui, th, self.prefs.view) {
-                    actions.push(Action::SetView(v));
-                }
-
-                ui.add_space(3.0);
-
-                // 5. Quick Tools: Preview toggle, Terminal toggle, Options gear
-                let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
-                let prev_btn = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("◨").size(th.font + 1.0).color(if preview_active { th.accent } else { th.dim })
-                    )
-                    .fill(if preview_active { th.accent.gamma_multiply(0.18) } else { th.pane })
-                    .stroke(Stroke::new(1.0_f32, if preview_active { th.accent.gamma_multiply(0.5) } else { th.hairline() }))
-                    .min_size(egui::vec2(28.0, 26.0)),
-                ).on_hover_text("Toggle Preview pane");
-                if prev_btn.clicked() {
-                    actions.push(Action::TogglePreview);
-                }
-
-                let term_active = self.terminal.open;
-                let term_btn = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("").size(th.font).color(if term_active { th.accent } else { th.dim })
-                    )
-                    .fill(if term_active { th.accent.gamma_multiply(0.18) } else { th.pane })
-                    .stroke(Stroke::new(1.0_f32, if term_active { th.accent.gamma_multiply(0.5) } else { th.hairline() }))
-                    .min_size(egui::vec2(28.0, 26.0)),
-                ).on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)");
-                if term_btn.clicked() {
-                    actions.push(Action::ToggleTerminal);
-                }
-
-                ui.menu_button("⚙", |ui| {
-                    let mut hidden = self.prefs.show_hidden;
-                    if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
-                        actions.push(Action::ToggleHidden);
-                        ui.close_menu();
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        let prefs = self.prefs.clone();
+                        let pane = self.pane_mut(side);
+                        pane.filter.clear();
+                        pane.rebuild(&prefs);
+                        resp.surrender_focus();
                     }
-                    let mut preview = self.prefs.show_preview;
-                    if ui.checkbox(&mut preview, "Preview pane").clicked() {
-                        actions.push(Action::TogglePreview);
-                        ui.close_menu();
-                    }
-                    let mut ext = self.prefs.show_extensions;
-                    if ui.checkbox(&mut ext, "File name extensions").clicked() {
-                        self.prefs.show_extensions = ext;
-                        self.prefs.save();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Appearance").small().color(th.dim));
-                    use chickenwm_core::theme::AppMode;
-                    for (m, label) in [(AppMode::System, "Follow system"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")] {
-                        if ui.radio(self.app_mode == m, label).clicked() {
-                            self.app_mode = m;
-                            if let Err(e) = chickenwm_core::theme::set_app_mode("files", m) {
-                                self.toast(format!("Couldn't change appearance: {e}"), true);
-                            }
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Dual pane  (F3 / Ctrl+D)").clicked() {
-                        actions.push(Action::ToggleDualPane);
-                        ui.close_menu();
-                    }
-                    if ui.button("Embedded terminal  (Ctrl+`)").clicked() {
-                        actions.push(Action::ToggleTerminal);
-                        ui.close_menu();
-                    }
-                    if ui.button("Undo  (Ctrl+Z)").clicked() {
-                        actions.push(Action::Undo);
-                        ui.close_menu();
-                    }
-                    if ui.button("Go anywhere…  (Ctrl+P)").clicked() {
-                        actions.push(Action::GoAnywhere);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("New folder  (Ctrl+Shift+N)").clicked() {
-                        actions.push(Action::NewFolder(self.pane(side).cwd.clone()));
-                        ui.close_menu();
-                    }
-                    if ui.button("Open in External Terminal").clicked() {
-                        actions.push(Action::Terminal(self.pane(side).cwd.clone()));
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
                 });
             });
 
@@ -2946,12 +2964,12 @@ fn view_segments(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
         (ViewMode::Columns, "▥ Columns", "Columns view (Ctrl+Shift+3)"),
         (ViewMode::Dual, "◫ Dual", "Dual pane (F3 / Ctrl+D / Ctrl+Shift+4)"),
     ];
-    let font = FontId::proportional(th.font - 1.5);
+    let font = FontId::proportional(th.font - 2.0);
     let widths: Vec<f32> = VIEWS
         .iter()
-        .map(|(_, label, _)| ui.painter().layout_no_wrap(label.to_string(), font.clone(), th.fg).size().x + 16.0)
+        .map(|(_, label, _)| ui.painter().layout_no_wrap(label.to_string(), font.clone(), th.fg).size().x + 10.0)
         .collect();
-    let (group, _) = ui.allocate_exact_size(egui::vec2(widths.iter().sum::<f32>() + 4.0, 26.0), Sense::hover());
+    let (group, _) = ui.allocate_exact_size(egui::vec2(widths.iter().sum::<f32>() + 4.0, 24.0), Sense::hover());
     let radius = CornerRadius::same(th.radius.clamp(4, 6));
     ui.painter().rect_filled(group, radius, th.pane);
     ui.painter().rect_stroke(group, radius, Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
