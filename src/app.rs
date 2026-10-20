@@ -2531,8 +2531,10 @@ impl eframe::App for FilesApp {
         self.handle_drag_and_drop(ctx, theme, &mut actions);
 
         let screen = ctx.screen_rect();
+        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        chickenwm_core::window_frame::handle_window_edge_resize(ctx, screen, is_max);
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_outer_border")));
-        painter.rect_stroke(screen, CornerRadius::same(theme.radius), Stroke::new(1.0_f32, theme.hairline().gamma_multiply(0.4)), egui::StrokeKind::Inside);
+        chickenwm_core::window_frame::paint_window_gradient_border(&painter, screen, theme.radius as f32);
 
         for a in actions {
             self.apply(a);

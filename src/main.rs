@@ -25,7 +25,8 @@ use chickenwm_core::failsafe::spawn_emergency_failsafe_thread;
 use chickenwm_core::init_tracing;
 use chickenwm_core::monitor::{enumerate_monitors, max_native_refresh_rate};
 use parking_lot::RwLock;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use windows::Win32::Storage::FileSystem::GetLogicalDriveStringsW;
@@ -163,9 +164,12 @@ fn main() -> Result<()> {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon-64.rgba").to_vec(), width: 64, height: 64 })
-            .with_title("ChickenWM Files")
-            .with_decorations(false)
-            .with_transparent(true)
+            .with_title("ChickenWM Files")
+
+            .with_decorations(false)
+
+            .with_transparent(true)
+
             .with_inner_size([1240.0, 760.0])
             .with_min_inner_size([640.0, 400.0])
             // Accept files dragged in from Explorer and other apps.
@@ -173,14 +177,22 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
-        "ChickenWM Files",
-        native_options,
-        Box::new(move |cc| {
-            if let Ok(handle) = cc.window_handle() {
-                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
+    eframe::run_native(
+
+        "ChickenWM Files",
+
+        native_options,
+
+        Box::new(move |cc| {
+
+            if let Ok(handle) = cc.window_handle() {
+
+                if let RawWindowHandle::Win32(win32) = handle.as_raw() {
+
+                    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
+
                     chickenwm_core::sys::apply_acrylic(hwnd, None);
+                    chickenwm_core::sys::enable_borderless_resizing(hwnd);
                     let corner = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
                     let _ = unsafe {
                         windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
@@ -189,11 +201,16 @@ fn main() -> Result<()> {
                             &corner as *const _ as *const _,
                             std::mem::size_of_val(&corner) as u32,
                         )
-                    };
-                }
-            }
-            Ok(Box::new(app::FilesApp::new(cc, initial_dir, initial_select, css, target_fps)))
-        }),
+                    };
+
+                }
+
+            }
+
+            Ok(Box::new(app::FilesApp::new(cc, initial_dir, initial_select, css, target_fps)))
+
+        }),
+
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
