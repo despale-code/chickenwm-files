@@ -2227,6 +2227,7 @@ impl FilesApp {
                     ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
                 });
             });
+            ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().bottom(), Stroke::new(1.0_f32, th.border));
         });
     }
 
@@ -2305,9 +2306,9 @@ impl FilesApp {
     fn draw_status(&mut self, ctx: &egui::Context, th: Theme) {
         let frame = egui::Frame::NONE
             .fill(th.sidebar)
-            .stroke(Stroke::new(1.0_f32, th.border))
             .inner_margin(egui::Margin::symmetric(12, 5));
         egui::TopBottomPanel::bottom("files_status").frame(frame).show(ctx, |ui| {
+            ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top(), Stroke::new(1.0_f32, th.border));
             ui.horizontal(|ui| {
                 let pane = self.pane(self.focused());
                 let mut text = format!("{} items", pane.visible.len());
@@ -2432,6 +2433,8 @@ impl FilesApp {
                         }
                     }
                 });
+                let rect = ui.max_rect();
+                ui.painter().vline(rect.right(), rect.y_range(), Stroke::new(1.0_f32, th.border));
             });
     }
 
@@ -2675,12 +2678,14 @@ impl FilesApp {
     }
     fn draw_center(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>, commit_rename: &mut bool) {
         if self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons) {
-            let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::same(10)).stroke(Stroke::new(1.0_f32, th.border));
+            let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(10, 8));
             egui::SidePanel::right("files_preview").resizable(true).default_width(300.0).width_range(200.0..=600.0).frame(frame).show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().vline(rect.left(), rect.y_range(), Stroke::new(1.0_f32, th.border));
                 self.draw_preview(ui, th);
             });
         }
-        let frame = egui::Frame::NONE.fill(th.bg).inner_margin(egui::Margin::same(8));
+        let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(6, 4));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             let view = self.prefs.view;
             let dragging = self.drag.is_some();
@@ -2728,46 +2733,44 @@ impl FilesApp {
                 actions,
                 extras: &extras,
             };
-            let pane_frame = |focused: bool| {
-                egui::Frame::NONE
-                    .fill(th.pane)
-                    .corner_radius(CornerRadius::same(th.radius))
-                    .stroke(Stroke::new(1.0_f32, if focused { th.accent.gamma_multiply(0.6) } else { th.border }))
-                    .inner_margin(egui::Margin::same(6))
-            };
             match view {
                 ViewMode::Details => {
-                    let memo = pane_frame(false).show(ui, |ui| draw.details(ui, Side::Main, &main, false, false, memo_main.as_ref())).inner;
+                    let memo = draw.details(ui, Side::Main, &main, false, false, memo_main.as_ref());
                     self.scroll.insert(Side::Main, memo);
                 }
                 ViewMode::Icons => {
-                    let memo = pane_frame(false).show(ui, |ui| draw.icons_grid(ui, Side::Main, &main, memo_main.as_ref(), &mut icon_cols)).inner;
+                    let memo = draw.icons_grid(ui, Side::Main, &main, memo_main.as_ref(), &mut icon_cols);
                     self.scroll.insert(Side::Main, memo);
                 }
                 ViewMode::Columns => {
                     let memo = ui.columns(3, |cols| {
-                        pane_frame(false).show(&mut cols[0], |ui| {
-                            ui.label(egui::RichText::new(main.cwd.parent().map(display_name).unwrap_or_default()).small().color(th.dim));
-                            draw.name_column(ui, "col_parent", &parent_entries, Some(&main.cwd), Side::Main);
-                        });
-                        let memo = pane_frame(false).show(&mut cols[1], |ui| draw.details(ui, Side::Main, &main, true, false, memo_main.as_ref())).inner;
-                        pane_frame(false).show(&mut cols[2], |ui| {
-                            if let Some(dir) = &preview_entry {
-                                ui.label(egui::RichText::new(display_name(dir)).small().color(th.dim));
-                                if child_entries.is_empty() {
-                                    ui.label(egui::RichText::new("This folder is empty").color(th.dim));
-                                }
-                                draw.name_column(ui, "col_child", &child_entries, None, Side::Main);
-                            } else {
-                                preview::body(ui, &th, preview, "col_preview");
+                        let r0 = cols[0].max_rect();
+                        cols[0].painter().vline(r0.right(), r0.y_range(), Stroke::new(1.0_f32, th.border));
+                        cols[0].label(egui::RichText::new(main.cwd.parent().map(display_name).unwrap_or_default()).small().color(th.dim));
+                        draw.name_column(&mut cols[0], "col_parent", &parent_entries, Some(&main.cwd), Side::Main);
+
+                        let r1 = cols[1].max_rect();
+                        cols[1].painter().vline(r1.right(), r1.y_range(), Stroke::new(1.0_f32, th.border));
+                        let memo = draw.details(&mut cols[1], Side::Main, &main, true, false, memo_main.as_ref());
+
+                        if let Some(dir) = &preview_entry {
+                            cols[2].label(egui::RichText::new(display_name(dir)).small().color(th.dim));
+                            if child_entries.is_empty() {
+                                cols[2].label(egui::RichText::new("This folder is empty").color(th.dim));
                             }
-                        });                        memo
+                            draw.name_column(&mut cols[2], "col_child", &child_entries, None, Side::Main);
+                        } else {
+                            preview::body(&mut cols[2], &th, preview, "col_preview");
+                        }
+                        memo
                     });
                     self.scroll.insert(Side::Main, memo);
                 }
                 ViewMode::Dual => {
                     let second = second.expect("dual pane");
                     let (m1, m2) = ui.columns(2, |cols| {
+                        let r0 = cols[0].max_rect();
+                        cols[0].painter().vline(r0.right(), r0.y_range(), Stroke::new(1.0_f32, th.border));
                         let pane_header = |ui: &mut egui::Ui, side: Side, title: &str, path: &Path, active: bool| {
                             let h_frame = egui::Frame::NONE
                                 .fill(if active { th.pane } else { th.sidebar })
@@ -2796,23 +2799,19 @@ impl FilesApp {
 
                         draw.focused = focus == Side::Main;
                         pane_header(&mut cols[0], Side::Main, &main.title(), &main.cwd, focus == Side::Main);
-                        let m1 = pane_frame(focus == Side::Main).show(&mut cols[0], |ui| {
-                            draw.details(ui, Side::Main, &main, true, true, memo_main.as_ref())
-                        });
+                        let m1 = draw.details(&mut cols[0], Side::Main, &main, true, true, memo_main.as_ref());
 
                         draw.focused = focus == Side::Second;
                         pane_header(&mut cols[1], Side::Second, &second.title(), &second.cwd, focus == Side::Second);
-                        let m2 = pane_frame(focus == Side::Second).show(&mut cols[1], |ui| {
-                            draw.details(ui, Side::Second, &second, true, true, memo_second.as_ref())
-                        });
+                        let m2 = draw.details(&mut cols[1], Side::Second, &second, true, true, memo_second.as_ref());
 
-                        if m1.response.clicked() || m1.response.contains_pointer() && cols[0].input(|i| i.pointer.any_pressed()) {
+                        if cols[0].rect_contains_pointer(cols[0].max_rect()) && cols[0].input(|i| i.pointer.any_pressed()) {
                             draw.actions.push(Action::Focus(Side::Main));
                         }
-                        if m2.response.clicked() || m2.response.contains_pointer() && cols[1].input(|i| i.pointer.any_pressed()) {
+                        if cols[1].rect_contains_pointer(cols[1].max_rect()) && cols[1].input(|i| i.pointer.any_pressed()) {
                             draw.actions.push(Action::Focus(Side::Second));
                         }
-                        (m1.inner, m2.inner)
+                        (m1, m2)
                     });
                     self.scroll.insert(Side::Main, m1);
                     self.scroll.insert(Side::Second, m2);
