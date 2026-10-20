@@ -1947,9 +1947,9 @@ impl Draw<'_> {
         let (date_w, type_w, size_w) = if compact { (128.0, 0.0, 76.0) } else { (140.0, 150.0, 84.0) };
         let name_w = (full.width() - date_w - type_w - size_w - 24.0).max(120.0);
 
-        // Header with sort buttons.
+        // Header with sort buttons (aligned with 4px left gap).
         let (header, _) = ui.allocate_exact_size(egui::vec2(full.width(), 26.0), Sense::hover());
-        let mut x = header.left() + 8.0;
+        let mut x = header.left() + 4.0 + 8.0;
         let mut col = |ui: &mut egui::Ui, label: &str, key: SortKey, w: f32, actions: &mut Vec<Action>| {
             if w <= 0.0 {
                 return;
@@ -1990,60 +1990,65 @@ impl Draw<'_> {
         let out = sa.show_rows(ui, row_h, pane.visible.len(), |ui, range| {
             for pos in range {
                 let Some(entry) = pane.entry_at(pos) else { continue };
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click_and_drag());
-                let selected = pane.selection.contains(&entry.path);
-                // Finder's alternating row stripes.
-                if pos % 2 == 1 && !selected {
-                    ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
-                }
-                self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
-                if let Some(mbox) = marquee_box {
-                    if mbox.intersects(rect) {
-                        marquee_hits.push(entry.path.clone());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(4.0); // 4-pixel gap on left for mouse selection box drag
+                    let row_w = (ui.available_width() - 4.0).max(60.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, row_h), Sense::click_and_drag());
+                    let selected = pane.selection.contains(&entry.path);
+                    // Finder's alternating row stripes.
+                    if pos % 2 == 1 && !selected {
+                        ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
                     }
-                }
-                let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
-                paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
-                let name_rect = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top() + 2.0), Pos2::new(rect.left() + 8.0 + name_w - 6.0, rect.bottom() - 2.0));
-                if !self.rename_field(ui, entry, name_rect) {
-                    let painter = ui.painter().with_clip_rect(name_rect);
-                    let color = if entry.hidden { th.name_color(entry).gamma_multiply(0.55) } else { th.name_color(entry) };
-                    painter.text(name_rect.left_center(), Align2::LEFT_CENTER, shown_name(entry, self.prefs), FontId::proportional(th.font), color);
-                }
-                let mut cx = rect.left() + 8.0 + name_w;
-                let small = FontId::proportional(th.font - 1.5);
-                let date = entry.modified.map(format_time).unwrap_or_default();
-                ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(date_w - 6.0, row_h)))
-                    .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, date, small.clone(), th.dim);
-                cx += date_w;
-                if type_w > 0.0 {
-                    ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(type_w - 6.0, row_h)))
-                        .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, type_label(self.icons, entry), small.clone(), th.dim);
-                    cx += type_w;
-                }
-                let size_text = if entry.is_dir {
-                    self.extras.sizes.get(&entry.path).map(|s| s.map(format_bytes).unwrap_or_else(|| "…".to_owned()))
-                } else {
-                    Some(format_bytes(entry.size))
-                };
-                if let Some(text) = size_text {
-                    ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, text, small.clone(), th.dim);
-                }
-                if let Some(&letter) = self.extras.git.get(&entry.path) {
-                    let badge_color = tools::git_badge_color(letter, &th);
-                    let badge_size = Vec2::new(16.0, 15.0);
-                    let badge_rect = Rect::from_center_size(Pos2::new(name_rect.right() - 10.0, rect.center().y), badge_size);
-                    ui.painter().rect_filled(badge_rect, CornerRadius::same(3), badge_color.gamma_multiply(0.18));
-                    ui.painter().rect_stroke(badge_rect, CornerRadius::same(3), Stroke::new(1.0_f32, badge_color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-                    ui.painter().text(
-                        badge_rect.center(),
-                        Align2::CENTER_CENTER,
-                        letter.to_string(),
-                        FontId::monospace(th.font - 3.0),
-                        badge_color,
-                    );
-                }
-                self.interact(&resp, side, pos, entry, pane, rect, dual);
+                    self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
+                    if let Some(mbox) = marquee_box {
+                        if mbox.intersects(rect) {
+                            marquee_hits.push(entry.path.clone());
+                        }
+                    }
+                    let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
+                    paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
+                    let name_rect = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top() + 2.0), Pos2::new(rect.left() + 8.0 + name_w - 6.0, rect.bottom() - 2.0));
+                    if !self.rename_field(ui, entry, name_rect) {
+                        let painter = ui.painter().with_clip_rect(name_rect);
+                        let color = if entry.hidden { th.name_color(entry).gamma_multiply(0.55) } else { th.name_color(entry) };
+                        painter.text(name_rect.left_center(), Align2::LEFT_CENTER, shown_name(entry, self.prefs), FontId::proportional(th.font), color);
+                    }
+                    let mut cx = rect.left() + 8.0 + name_w;
+                    let small = FontId::proportional(th.font - 1.5);
+                    let date = entry.modified.map(format_time).unwrap_or_default();
+                    ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(date_w - 6.0, row_h)))
+                        .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, date, small.clone(), th.dim);
+                    cx += date_w;
+                    if type_w > 0.0 {
+                        ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(type_w - 6.0, row_h)))
+                            .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, type_label(self.icons, entry), small.clone(), th.dim);
+                        cx += type_w;
+                    }
+                    let size_text = if entry.is_dir {
+                        self.extras.sizes.get(&entry.path).map(|s| s.map(format_bytes).unwrap_or_else(|| "…".to_owned()))
+                    } else {
+                        Some(format_bytes(entry.size))
+                    };
+                    if let Some(text) = size_text {
+                        ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, text, small.clone(), th.dim);
+                    }
+                    if let Some(&letter) = self.extras.git.get(&entry.path) {
+                        let badge_color = tools::git_badge_color(letter, &th);
+                        let badge_size = Vec2::new(16.0, 15.0);
+                        let badge_rect = Rect::from_center_size(Pos2::new(name_rect.right() - 10.0, rect.center().y), badge_size);
+                        ui.painter().rect_filled(badge_rect, CornerRadius::same(3), badge_color.gamma_multiply(0.18));
+                        ui.painter().rect_stroke(badge_rect, CornerRadius::same(3), Stroke::new(1.0_f32, badge_color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                        ui.painter().text(
+                            badge_rect.center(),
+                            Align2::CENTER_CENTER,
+                            letter.to_string(),
+                            FontId::monospace(th.font - 3.0),
+                            badge_color,
+                        );
+                    }
+                    self.interact(&resp, side, pos, entry, pane, rect, dual);
+                });
             }
         });
         if let Some(m) = self.marquee.as_ref() {
@@ -2091,7 +2096,7 @@ impl Draw<'_> {
         self.empty_message(ui, list_rect, pane);
 
         // AUTOFIT: distribute width evenly across all columns so there is no gap on the right!
-        let available_w = (list_rect.width() - 16.0).max(60.0);
+        let available_w = (list_rect.width() - 8.0).max(60.0);
         let base_w = (122.0 * scale).round();
         let base_h = (118.0 * scale).round();
         let gap = (14.0 * scale).round().max(12.0);
@@ -2123,7 +2128,7 @@ impl Draw<'_> {
             for row in range {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    ui.add_space(8.0);
+                    ui.add_space(4.0); // 4-pixel gap on left for mouse selection box drag
                     for pos in row * cols..((row + 1) * cols).min(pane.visible.len()) {
                         let Some(entry) = pane.entry_at(pos) else { continue };
                         let (slot_rect, _) = ui.allocate_exact_size(tile, Sense::hover());
@@ -2185,19 +2190,24 @@ impl Draw<'_> {
         let th = self.theme;
         egui::ScrollArea::vertical().id_salt(salt).auto_shrink([false, false]).show_rows(ui, th.row_h, entries.len(), |ui, range| {
             for e in &entries[range] {
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), th.row_h), Sense::click());
-                let hl = highlight == Some(e.path.as_path());
-                self.row_background(ui, rect, &resp, hl, false);
-                let icon = Rect::from_center_size(Pos2::new(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0));
-                paint_icon(ui, self.icons, &e.icon_key, false, icon, e.is_dir, &th);
-                ui.painter().with_clip_rect(rect.shrink(2.0)).text(Pos2::new(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, &e.name, FontId::proportional(th.font), th.name_color(e));
-                if e.is_dir {
-                    ui.painter().text(rect.right_center() - egui::vec2(8.0, 0.0), Align2::RIGHT_CENTER, "›", FontId::proportional(th.font), th.dim);
-                    self.zones.push(DropZone { rect, dir: e.path.clone() });
-                }
-                if resp.clicked() {
-                    self.actions.push(Action::Open(open_side, e.path.clone()));
-                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(4.0); // 4-pixel gap on left
+                    let row_w = (ui.available_width() - 4.0).max(60.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, th.row_h), Sense::click());
+                    let hl = highlight == Some(e.path.as_path());
+                    self.row_background(ui, rect, &resp, hl, false);
+                    let icon = Rect::from_center_size(Pos2::new(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0));
+                    paint_icon(ui, self.icons, &e.icon_key, false, icon, e.is_dir, &th);
+                    ui.painter().with_clip_rect(rect.shrink(2.0)).text(Pos2::new(rect.left() + 30.0, rect.center().y), Align2::LEFT_CENTER, &e.name, FontId::proportional(th.font), th.name_color(e));
+                    if e.is_dir {
+                        ui.painter().text(rect.right_center() - egui::vec2(8.0, 0.0), Align2::RIGHT_CENTER, "›", FontId::proportional(th.font), th.dim);
+                        self.zones.push(DropZone { rect, dir: e.path.clone() });
+                    }
+                    if resp.clicked() {
+                        self.actions.push(Action::Open(open_side, e.path.clone()));
+                    }
+                });
             }
         });
     }
