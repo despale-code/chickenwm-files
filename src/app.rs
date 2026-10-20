@@ -103,7 +103,9 @@ enum Action {
     Refresh,
     NewTab,
     CloseTab(usize),
+    #[allow(dead_code)]
     DuplicateTab(usize),
+    #[allow(dead_code)]
     CloseOtherTabs(usize),
     SwitchTab(usize),
     Back(Side),
@@ -2258,9 +2260,9 @@ impl eframe::App for FilesApp {
 
         self.zones.clear();
         let mut commit_rename = false;
-        self.draw_top(ctx, theme, &mut actions);
-        self.draw_status(ctx, theme);
         self.draw_sidebar(ctx, theme, &mut actions);
+        self.draw_status(ctx, theme);
+        self.draw_navbar(ctx, theme, &mut actions);
         self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
         self.draw_tools(ctx, theme);
         self.compress_dialog(ctx, theme);
@@ -2278,105 +2280,13 @@ impl eframe::App for FilesApp {
 }
 
 impl FilesApp {
-    fn draw_top(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
-        let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin::symmetric(10, 6));
-        egui::TopBottomPanel::top("files_top").frame(frame).show(ctx, |ui| {
-            // ROW 1: TABS (Always visible)
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let count = self.tabs.len();
-                let avail_w = (ui.available_width() - 140.0).max(120.0);
-                let tab_w = ((avail_w - (count as f32 - 1.0) * 4.0) / count as f32).clamp(90.0, 220.0);
+    fn draw_navbar(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
+        let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin { left: 10, right: 10, top: 6, bottom: 6 });
+        egui::TopBottomPanel::top("files_navbar").frame(frame).show(ctx, |ui| {
+            // Underneath: single hairline border separating navbar from folder view
+            let bottom_y = ui.cursor().bottom() + 6.0;
+            ui.painter().hline(ui.available_rect_before_wrap().x_range(), bottom_y, Stroke::new(1.0_f32, th.hairline()));
 
-                for i in 0..count {
-                    let active = i == self.active;
-                    let title = self.tabs[i].title();
-                    let fill = if active { th.pane } else { th.fg.gamma_multiply(0.04) };
-                    let stroke = if active {
-                        Stroke::new(1.0_f32, th.accent.gamma_multiply(0.6))
-                    } else {
-                        Stroke::new(1.0_f32, th.border.gamma_multiply(0.5))
-                    };
-
-                    let resp = egui::Frame::NONE
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(th.radius.clamp(4, 7)))
-                        .stroke(stroke)
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            ui.set_width(tab_w);
-                            ui.horizontal(|ui| {
-                                let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-                                paint_icon(ui, &mut self.icons, &format!("path:{}", self.tabs[i].cwd.display()), false, icon_rect, true, &th);
-
-                                let label_color = if active { th.fg } else { th.dim };
-                                let label = ui.add(
-                                    egui::Label::new(egui::RichText::new(title).size(th.font - 1.0).color(label_color))
-                                        .sense(Sense::click())
-                                        .truncate(),
-                                );
-
-                                let close = ui.add(
-                                    egui::Button::new(egui::RichText::new("×").size(th.font).color(if active { th.dim } else { th.dim.gamma_multiply(0.5) }))
-                                        .frame(false)
-                                        .min_size(Vec2::splat(14.0)),
-                                ).on_hover_text("Close tab (Ctrl+W)");
-                                if close.clicked() {
-                                    actions.push(Action::CloseTab(i));
-                                }
-                                label
-                            }).inner
-                        });
-
-                    let label = resp.inner;
-                    let rect = resp.response.rect;
-                    let tab_resp = ui.interact(rect, ui.id().with(("tab_bar", i)), Sense::click());
-                    if label.clicked() || tab_resp.clicked() {
-                        actions.push(Action::SwitchTab(i));
-                    }
-                    if label.middle_clicked() || tab_resp.middle_clicked() {
-                        actions.push(Action::CloseTab(i));
-                    }
-                    self.zones.push(DropZone { rect, dir: self.tabs[i].cwd.clone() });
-
-                    let n = count;
-                    tab_resp.union(label).context_menu(|ui| {
-                        if ui.button("New tab").clicked() {
-                            actions.push(Action::NewTab);
-                            ui.close_menu();
-                        }
-                        if ui.button("Duplicate tab").clicked() {
-                            actions.push(Action::DuplicateTab(i));
-                            ui.close_menu();
-                        }
-                        if ui.add_enabled(n > 1, egui::Button::new("Close tab")).clicked() {
-                            actions.push(Action::CloseTab(i));
-                            ui.close_menu();
-                        }
-                        if ui.add_enabled(n > 1, egui::Button::new("Close other tabs")).clicked() {
-                            actions.push(Action::CloseOtherTabs(i));
-                            ui.close_menu();
-                        }
-                    });
-                }
-
-                // New tab button '+'
-                if ui.add(
-                    egui::Button::new(egui::RichText::new("+").size(th.font + 2.0).color(th.dim))
-                        .frame(false)
-                        .min_size(egui::vec2(24.0, 24.0)),
-                ).on_hover_text("New tab (Ctrl+T)").clicked() {
-                    actions.push(Action::NewTab);
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("ChickenWM").small().monospace().color(th.dim.gamma_multiply(0.5)));
-                });
-            });
-
-            ui.add_space(5.0);
-
-            // ROW 2: UNIFIED ACTION & ADDRESS TOOLBAR
             ui.horizontal(|ui| {
                 let side = self.focused();
                 let pane = self.pane(side);
@@ -2423,13 +2333,53 @@ impl FilesApp {
                 ui.add_space(4.0);
 
                 // 2. Breadcrumbs / Address bar: stretches to meet the right toolbar exactly
-                let right_needed = 380.0;
+                let right_needed = 480.0;
                 let addr_w = (ui.available_width() - right_needed).max(120.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
-                // 3. Right-anchored toolbar section (Tools, Views dropdown, Search)
+                // 3. Right-anchored toolbar section (Close button on top right, Tools, Views dropdown, Search)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 4.0;
+
+                    // Close button in place of ChickenWM label on top right
+                    let (close_rect, close_resp) = ui.allocate_exact_size(Vec2::new(28.0, 26.0), Sense::click());
+                    if close_resp.hovered() {
+                        ui.painter().rect_filled(close_rect, CornerRadius::same(5), Color32::from_rgb(225, 60, 60));
+                    }
+                    let close_col = if close_resp.hovered() { Color32::WHITE } else { th.dim };
+                    let c = close_rect.center();
+                    ui.painter().line_segment([c + Vec2::new(-4.5, -4.5), c + Vec2::new(4.5, 4.5)], Stroke::new(1.4_f32, close_col));
+                    ui.painter().line_segment([c + Vec2::new(4.5, -4.5), c + Vec2::new(-4.5, 4.5)], Stroke::new(1.4_f32, close_col));
+                    if close_resp.on_hover_text("Close window").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+
+                    // Maximize / Restore button
+                    let (max_rect, max_resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+                    if max_resp.hovered() {
+                        ui.painter().rect_filled(max_rect, CornerRadius::same(5), th.fg.gamma_multiply(0.08));
+                    }
+                    let max_col = if max_resp.hovered() { th.fg } else { th.dim };
+                    let mc = max_rect.center();
+                    ui.painter().rect_stroke(Rect::from_center_size(mc, Vec2::splat(9.0)), CornerRadius::same(2), Stroke::new(1.2_f32, max_col), egui::StrokeKind::Inside);
+                    if max_resp.on_hover_text("Maximize / Restore").clicked() {
+                        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
+
+                    // Minimize button
+                    let (min_rect, min_resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+                    if min_resp.hovered() {
+                        ui.painter().rect_filled(min_rect, CornerRadius::same(5), th.fg.gamma_multiply(0.08));
+                    }
+                    let min_col = if min_resp.hovered() { th.fg } else { th.dim };
+                    let min_c = min_rect.center();
+                    ui.painter().line_segment([min_c + Vec2::new(-4.5, 0.0), min_c + Vec2::new(4.5, 0.0)], Stroke::new(1.4_f32, min_col));
+                    if min_resp.on_hover_text("Minimize").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+
+                    ui.add_space(4.0);
 
                     // Quick Tools: Options Gear, Terminal, Preview (monotone vector icons, 28px height)
                     let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
@@ -2501,7 +2451,7 @@ impl FilesApp {
                                 ui.close_menu();
                             }
                             ui.separator();
-                            ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
+                            ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+L Address").small().color(th.dim));
                         });
                         let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
                         paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
@@ -2531,7 +2481,7 @@ impl FilesApp {
                         }
                     });
 
-                    // View Mode Dropdown (replaces segmented view buttons)
+                    // View Mode Dropdown
                     if let Some(v) = view_dropdown(ui, th, self.prefs.view) {
                         actions.push(Action::SetView(v));
                     }
@@ -2602,9 +2552,21 @@ impl FilesApp {
                         pane.rebuild(&prefs);
                         resp.surrender_focus();
                     }
+
+                    // Window drag on empty space between search bar and address bar
+                    let empty_rect = ui.available_rect_before_wrap();
+                    if empty_rect.width() > 10.0 {
+                        let drag_resp = ui.interact(empty_rect, ui.id().with("win_drag_nav"), Sense::drag());
+                        if drag_resp.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if drag_resp.double_clicked() {
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                        }
+                    }
                 });
             });
-
         });
     }
 
@@ -2682,7 +2644,8 @@ impl FilesApp {
 
     fn draw_status(&mut self, ctx: &egui::Context, th: Theme) {
         let frame = egui::Frame::NONE
-            .fill(th.sidebar)
+            .fill(th.pane)
+            .stroke(Stroke::new(1.0_f32, th.hairline()))
             .inner_margin(egui::Margin::symmetric(12, 5));
         egui::TopBottomPanel::bottom("files_status").frame(frame).show(ctx, |ui| {
 
@@ -2767,7 +2730,9 @@ impl FilesApp {
     /// Finder-style sidebar: "Favorites" (the user's own folders: add, remove, rename, drag to
     /// reorder) and "Locations" (drives). Each section folds away from its header.
     fn draw_sidebar(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
-        let frame = egui::Frame::NONE.fill(th.sidebar).inner_margin(egui::Margin { left: 10, right: 10, top: 8, bottom: 8 });
+        // Acrylic frosted-glass semi-transparent background
+        let sidebar_bg = Color32::from_rgba_unmultiplied(th.sidebar.r(), th.sidebar.g(), th.sidebar.b(), 145);
+        let frame = egui::Frame::NONE.fill(sidebar_bg).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 8 });
         egui::SidePanel::left("files_sidebar")
             .resizable(true)
             .default_width(210.0)
@@ -2775,6 +2740,15 @@ impl FilesApp {
             .show_separator_line(true)
             .frame(frame)
             .show(ctx, |ui| {
+                // Top drag region matching navbar height (~38px)
+                let (_, drag_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::drag());
+                if drag_resp.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if drag_resp.double_clicked() {
+                    let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     let cwd = self.pane(self.focused()).cwd.clone();
