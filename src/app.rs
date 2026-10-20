@@ -2093,7 +2093,7 @@ impl Draw<'_> {
         // AUTOFIT: distribute width evenly across all columns so there is no gap on the right!
         let available_w = (list_rect.width() - 8.0).max(60.0);
         let base_w = (122.0 * scale).round();
-        let base_h = (118.0 * scale).round();
+        let base_h = (94.0 * scale).round();
         let gap = (14.0 * scale).round().max(12.0);
 
         let cols = ((available_w + gap) / (base_w + gap)).floor().max(1.0) as usize;
@@ -2141,14 +2141,21 @@ impl Draw<'_> {
                         let icon_size = (50.4 * scale).round();
                         let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (31.0 * scale).round()), Vec2::splat(icon_size));
                         paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
-                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (60.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
-                        if !self.rename_field(ui, entry, Rect::from_min_size(label_rect.min, egui::vec2(label_rect.width(), 24.0))) {
-                            let galley = ui.painter().layout(
+                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (58.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
+                        let rename_w = (rect.width() * 0.80).round();
+                        let rename_rect = Rect::from_center_size(Pos2::new(rect.center().x, label_rect.top() + 12.0), Vec2::new(rename_w, 24.0));
+                        if !self.rename_field(ui, entry, rename_rect) {
+                            let font_size = (th.font - 1.5) * scale.clamp(0.85, 1.3);
+                            let mut job = egui::text::LayoutJob::simple(
                                 shown_name(entry, self.prefs),
-                                FontId::proportional((th.font - 1.5) * scale.clamp(0.85, 1.3)),
+                                FontId::proportional(font_size),
                                 th.name_color(entry),
                                 label_rect.width(),
                             );
+                            job.wrap.max_rows = 2;
+                            job.wrap.overflow_character = Some('…');
+                            job.halign = egui::Align::Center;
+                            let galley = ui.fonts(|f| f.layout_job(job));
                             let painter = ui.painter().with_clip_rect(label_rect);
                             let x = label_rect.center().x - galley.size().x / 2.0;
                             painter.galley(Pos2::new(x, label_rect.top()), galley, th.fg);
