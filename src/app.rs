@@ -221,8 +221,8 @@ impl Theme {
         ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
         let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = Color32::TRANSPARENT;
-        // Acrylic frosted-glass translucent background for context menus and popups
-        let menu_bg = Color32::from_rgba_unmultiplied(self.sidebar.r(), self.sidebar.g(), self.sidebar.b(), 40);
+        // Context menus and popups: clean solid pane fill so items underneath don't show through unblurred
+        let menu_bg = self.pane;
         v.window_fill = menu_bg;
         v.extreme_bg_color = self.sidebar;
         v.faint_bg_color = self.pane;
@@ -2456,6 +2456,10 @@ impl Draw<'_> {
 }
 
 impl eframe::App for FilesApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(h) = hwnd_of(frame) {
             self.hwnd = h;
