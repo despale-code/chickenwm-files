@@ -43,6 +43,14 @@ struct Marquee {
     initial_selection: std::collections::HashSet<PathBuf>,
 }
 
+#[derive(Clone)]
+struct CompressPrompt {
+    paths: Vec<PathBuf>,
+    dir: PathBuf,
+    name_buffer: String,
+    initial_focus: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropKind {
     Copy,
@@ -75,6 +83,7 @@ enum Action {
     NativeMenu(Vec<PathBuf>),
     Extract { archive: PathBuf, into_folder: bool },
     Compress(Vec<PathBuf>),
+    ExecuteCompress { paths: Vec<PathBuf>, zip_path: PathBuf },
     Shortcut(Vec<PathBuf>),
     Terminal(PathBuf),
     /// Add a folder to the sidebar's Favorites.
@@ -314,6 +323,8 @@ pub struct FilesApp {
     focus_search: bool,
     drag: Option<Drag>,
     marquee: Option<Marquee>,
+    compress_prompt: Option<CompressPrompt>,
+    pending_focus: Option<(Side, PathBuf)>,
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
     jobs: Arc<Jobs>,
@@ -499,6 +510,8 @@ impl FilesApp {
             focus_search: false,
             drag: None,
             marquee: None,
+            compress_prompt: None,
+            pending_focus: None,
             zones: Vec::new(),
             drop_menu: None,
             jobs: Arc::new(Jobs {
@@ -772,19 +785,35 @@ impl FilesApp {
             Action::Compress(paths) if !paths.is_empty() => {
                 let dir = paths[0].parent().map(Path::to_path_buf).unwrap_or_default();
                 let stem = if paths.len() == 1 {
-                    paths[0].file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                    let s = paths[0].file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    if s.is_empty() { "archive".into() } else { s }
                 } else {
                     display_name(&dir)
                 };
-                let zip_path = unique_path(&dir, &stem, "zip");
-                let name = display_name(&zip_path);
-                self.spawn_job(format!("Compressing to {name}…"), move |progress| {
-                    compress_zip(&paths, &zip_path, progress)
-                        .map(|_| format!("Created {name}"))
-                        .map_err(|e| format!("Compress failed: {e}"))
+                let default_name = format!("{stem}.zip");
+                self.compress_prompt = Some(CompressPrompt {
+                    paths,
+                    dir,
+                    name_buffer: default_name,
+                    initial_focus: true,
                 });
             }
             Action::Compress(_) => {}
+            Action::ExecuteCompress { paths, zip_path } if !paths.is_empty() => {
+                let name = display_name(&zip_path);
+                let dirty = self.dirty.clone();
+                let target_path = zip_path.clone();
+                let side = self.focused();
+                self.pending_focus = Some((side, target_path));
+                self.spawn_job(format!("Compressing to {name}…"), move |progress| {
+                    let res = compress_zip(&paths, &zip_path, progress)
+                        .map(|_| format!("Created {name}"))
+                        .map_err(|e| format!("Compress failed: {e}"));
+                    dirty.store(true, Ordering::Relaxed);
+                    res
+                });
+            }
+            Action::ExecuteCompress { .. } => {}
             Action::Shortcut(paths) => {
                 for p in &paths {
                     let dir = p.parent().unwrap_or(p);
@@ -2190,6 +2219,16 @@ impl eframe::App for FilesApp {
                 ctx.request_repaint_after(Duration::from_millis(260));
             }
         }
+
+        // Auto focus newly created compressed file or created items
+        if let Some((target_side, target_path)) = self.pending_focus.clone() {
+            let pane = self.pane_mut(target_side);
+            if pane.visible.iter().any(|&i| pane.entries[i].path == target_path) {
+                pane.select_path(&target_path);
+                self.pending_focus = None;
+            }
+        }
+
         if self.drives_at.elapsed() > Duration::from_secs(30) {
             self.refresh_drives();
         }
@@ -2224,6 +2263,7 @@ impl eframe::App for FilesApp {
         self.draw_sidebar(ctx, theme, &mut actions);
         self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
         self.draw_tools(ctx, theme);
+        self.compress_dialog(ctx, theme);
         self.handle_drag_and_drop(ctx, theme, &mut actions);
 
         for a in actions {
@@ -3318,4 +3358,111 @@ fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
 /// `C:\` for any path on drive C.
 fn pane_root(path: &Path) -> PathBuf {
     path.ancestors().last().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
+}
+
+impl FilesApp {
+    fn compress_dialog(&mut self, ctx: &egui::Context, th: Theme) {
+        let Some(prompt) = self.compress_prompt.as_mut() else { return };
+        let mut commit = false;
+        let mut cancel = false;
+
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(th.pane)
+            .corner_radius(CornerRadius::same(th.radius.max(8)))
+            .stroke(Stroke::new(1.0_f32, th.border))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(150),
+            })
+            .inner_margin(egui::Margin::same(16));
+
+        egui::Window::new("Compress to ZIP")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(400.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    chickenwm_core::ui_icons::paint_folder(ui.painter(), icon_r, th.accent);
+                    ui.add_space(4.0);
+                    ui.heading("Compress to ZIP Archive");
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("Compressing {} selected item(s)", prompt.paths.len())).color(th.dim));
+                ui.add_space(12.0);
+
+                ui.label(egui::RichText::new("Archive filename:").strong().size(th.font));
+                ui.add_space(4.0);
+
+                let id = egui::Id::new("compress_name_input");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.name_buffer)
+                        .id(id)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .font(FontId::proportional(th.font)),
+                );
+
+                if prompt.initial_focus {
+                    prompt.initial_focus = false;
+                    resp.request_focus();
+                    let stem_len = prompt.name_buffer.trim_end_matches(".zip").trim_end_matches(".ZIP").chars().count();
+                    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(stem_len),
+                        )));
+                        state.store(ctx, id);
+                    }
+                }
+
+                if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn_h = 28.0;
+                        if ui.add(egui::Button::new(egui::RichText::new("Compress").strong().color(Color32::WHITE))
+                            .fill(th.accent)
+                            .min_size(egui::vec2(85.0, btn_h))).clicked()
+                        {
+                            commit = true;
+                        }
+                        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(75.0, btn_h))).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.compress_prompt = None;
+        } else if commit {
+            if let Some(prompt) = self.compress_prompt.take() {
+                let mut name = prompt.name_buffer.trim().to_string();
+                if name.is_empty() {
+                    name = "archive.zip".to_string();
+                }
+                if !name.to_ascii_lowercase().ends_with(".zip") {
+                    name.push_str(".zip");
+                }
+                let stem = name.trim_end_matches(".zip").trim_end_matches(".ZIP");
+                let zip_path = unique_path(&prompt.dir, stem, "zip");
+                self.apply(Action::ExecuteCompress {
+                    paths: prompt.paths,
+                    zip_path,
+                });
+            }
+        }
+    }
 }

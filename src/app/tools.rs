@@ -9,7 +9,7 @@
 use super::{config_dir, display_name, quick_access, Action, FilesApp, Theme};
 use crate::model::format_bytes;
 use crate::shell::{self, FileOp};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
+use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -816,75 +816,137 @@ impl FilesApp {
         let mut extract_all: Option<bool> = None;
         let mut open_member: Option<String> = None;
         let mut extract_member_here: Option<String> = None;
-        egui::Window::new(display_name(&av.archive))
+
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(th.pane)
+            .corner_radius(CornerRadius::same(th.radius.max(8)))
+            .stroke(Stroke::new(1.0_f32, th.border))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 10],
+                blur: 28,
+                spread: 0,
+                color: Color32::from_black_alpha(160),
+            })
+            .inner_margin(egui::Margin::symmetric(14, 12));
+
+        let win_title = format!("Archive — {}", display_name(&av.archive));
+        egui::Window::new(win_title)
             .open(&mut open)
             .collapsible(false)
-            .default_size([560.0, 480.0])
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(true)
+            .movable(true)
+            .constrain(true)
+            .default_size([680.0, 500.0])
+            .min_size([460.0, 320.0])
+            .default_pos(Pos2::new(140.0, 80.0))
+            .frame(frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!av.dir.is_empty(), egui::Button::new("⬆")).clicked() {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if ui.add_enabled(!av.dir.is_empty(), egui::Button::new("⬆ Up").min_size(egui::vec2(54.0, 26.0))).clicked() {
                         av.dir = av.dir.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
                     }
-                    ui.label(format!("/{}", av.dir));
+                    let path_text = if av.dir.is_empty() {
+                        "/ (Root)".to_string()
+                    } else {
+                        format!("/{}", av.dir)
+                    };
+                    ui.label(egui::RichText::new(path_text).strong().size(th.font));
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Extract to folder").clicked() {
+                        if ui.add(egui::Button::new("Extract to folder").min_size(egui::vec2(0.0, 26.0))).clicked() {
                             extract_all = Some(true);
                         }
-                        if ui.button("Extract here").clicked() {
+                        if ui.add(egui::Button::new("Extract here").min_size(egui::vec2(0.0, 26.0))).clicked() {
                             extract_all = Some(false);
                         }
                     });
                 });
+
+                ui.add_space(4.0);
                 ui.separator();
+
                 match &av.items {
                     Err(e) => {
                         ui.colored_label(Color32::from_rgb(220, 90, 80), format!("Can't read this archive: {e}"));
                     }
                     Ok(items) => {
                         let children = archive_children(items, &av.dir);
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            let w = ui.available_width();
-                            for c in &children {
-                                let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, th.row_h), Sense::click());
-                                let selected = av.selected.as_deref() == Some(c.path.as_str());
-                                if selected {
-                                    ui.painter().rect_filled(rect, 4.0, th.selected);
-                                } else if resp.hovered() {
-                                    ui.painter().rect_filled(rect, 4.0, th.accent.gamma_multiply(0.1));
-                                }
-                                let font = FontId::proportional(th.font);
-                                let label = if c.is_dir { format!("{name}/") } else { name.to_owned() };
-                                ui.painter().text(rect.left_center() + egui::vec2(6.0, 0.0), Align2::LEFT_CENTER, label, font.clone(), if c.is_dir { th.dir } else { th.fg });
-                                if let Some(s) = c.size {
-                                    ui.painter().text(rect.right_center() - egui::vec2(6.0, 0.0), Align2::RIGHT_CENTER, format_bytes(s), FontId::proportional(th.font - 1.5), th.dim);
-                                }
-                                if resp.clicked() {
-                                    av.selected = Some(c.path.clone());
-                                }
-                                if resp.double_clicked() {
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(34.0);
+                            ui.label(egui::RichText::new("Name").small().color(th.dim));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new("Size").small().color(th.dim));
+                            });
+                        });
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let w = ui.available_width();
+                                for c in &children {
+                                    let name = c.path.rsplit('/').next().unwrap_or(&c.path);
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, th.row_h), Sense::click());
+                                    let selected = av.selected.as_deref() == Some(c.path.as_str());
+                                    if selected {
+                                        ui.painter().rect_filled(rect, 4.0, th.selected);
+                                    } else if resp.hovered() {
+                                        ui.painter().rect_filled(rect, 4.0, th.accent.gamma_multiply(0.12));
+                                    }
+
+                                    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0));
                                     if c.is_dir {
-                                        av.dir = c.path.clone();
-                                        av.selected = None;
+                                        chickenwm_core::ui_icons::paint_folder(ui.painter(), icon_rect, th.dir);
                                     } else {
-                                        open_member = Some(c.path.clone());
+                                        chickenwm_core::ui_icons::paint_window(ui.painter(), icon_rect, th.dim);
+                                    }
+
+                                    let font = FontId::proportional(th.font);
+                                    ui.painter().text(
+                                        rect.left_center() + egui::vec2(32.0, 0.0),
+                                        Align2::LEFT_CENTER,
+                                        name,
+                                        font.clone(),
+                                        if c.is_dir { th.dir } else { th.fg },
+                                    );
+                                    if let Some(s) = c.size {
+                                        ui.painter().text(
+                                            rect.right_center() - egui::vec2(12.0, 0.0),
+                                            Align2::RIGHT_CENTER,
+                                            format_bytes(s),
+                                            FontId::proportional(th.font - 1.5),
+                                            th.dim,
+                                        );
+                                    }
+
+                                    if resp.clicked() {
+                                        av.selected = Some(c.path.clone());
+                                    }
+                                    if resp.double_clicked() {
+                                        if c.is_dir {
+                                            av.dir = c.path.clone();
+                                            av.selected = None;
+                                        } else {
+                                            open_member = Some(c.path.clone());
+                                        }
+                                    }
+                                    if !c.is_dir {
+                                        resp.context_menu(|ui| {
+                                            if ui.button("Open").clicked() {
+                                                open_member = Some(c.path.clone());
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Extract next to the archive").clicked() {
+                                                extract_member_here = Some(c.path.clone());
+                                                ui.close_menu();
+                                            }
+                                        });
                                     }
                                 }
-                                if !c.is_dir {
-                                    resp.context_menu(|ui| {
-                                        if ui.button("Open").clicked() {
-                                            open_member = Some(c.path.clone());
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Extract next to the archive").clicked() {
-                                            extract_member_here = Some(c.path.clone());
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                            }
-                        });
+                            });
                     }
                 }
             });
