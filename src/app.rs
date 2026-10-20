@@ -2046,19 +2046,19 @@ impl Draw<'_> {
 
         // AUTOFIT: distribute width evenly across all columns so there is no gap on the right!
         let available_w = (list_rect.width() - 16.0).max(60.0);
-        let base_w = (112.0 * scale).round();
-        let base_h = (104.0 * scale).round();
-        let min_gap = 6.0_f32;
+        let base_w = (122.0 * scale).round();
+        let base_h = (118.0 * scale).round();
+        let gap = (14.0 * scale).round().max(12.0);
 
-        let cols = ((available_w + min_gap) / (base_w + min_gap)).floor().max(1.0) as usize;
+        let cols = ((available_w + gap) / (base_w + gap)).floor().max(1.0) as usize;
         *cols_out = cols;
 
-        let total_gaps = (cols.saturating_sub(1)) as f32 * min_gap;
+        let total_gaps = (cols.saturating_sub(1)) as f32 * gap;
         let tile_w = ((available_w - total_gaps) / cols as f32).floor();
         let tile = egui::vec2(tile_w, base_h);
-        let gap = min_gap;
+        let row_h = tile.y + gap;
         let rows = pane.visible.len().div_ceil(cols);
-        let sa = self.scroll_area(side, "icons", pane, tile.y + gap, cols, memo);
+        let sa = self.scroll_area(side, "icons", pane, row_h, cols, memo);
 
         let mut marquee_hits = Vec::new();
         let marquee_box = if let Some(m) = self.marquee.as_ref() {
@@ -2072,14 +2072,17 @@ impl Draw<'_> {
             None
         };
 
-        let out = sa.show_rows(ui, tile.y + gap, rows, |ui, range| {
+        let out = sa.show_rows(ui, row_h, rows, |ui, range| {
+            ui.spacing_mut().item_spacing.y = gap;
             for row in range {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = min_gap;
+                    ui.spacing_mut().item_spacing.x = gap;
                     ui.add_space(8.0);
                     for pos in row * cols..((row + 1) * cols).min(pane.visible.len()) {
                         let Some(entry) = pane.entry_at(pos) else { continue };
-                        let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
+                        let (slot_rect, _) = ui.allocate_exact_size(tile, Sense::hover());
+                        let rect = slot_rect.shrink2(egui::vec2(2.0, 2.0));
+                        let resp = ui.interact(rect, ui.id().with(("item", side, pos)), Sense::click_and_drag());
                         let selected = pane.selection.contains(&entry.path);
                         self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
 
@@ -2089,14 +2092,14 @@ impl Draw<'_> {
                             }
                         }
 
-                        let icon_size = (42.0 * scale).round();
-                        let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (26.0 * scale).round()), Vec2::splat(icon_size));
+                        let icon_size = (50.4 * scale).round();
+                        let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (31.0 * scale).round()), Vec2::splat(icon_size));
                         paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
-                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (52.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 1.0));
+                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (60.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
                         if !self.rename_field(ui, entry, Rect::from_min_size(label_rect.min, egui::vec2(label_rect.width(), 24.0))) {
                             let galley = ui.painter().layout(
                                 shown_name(entry, self.prefs),
-                                FontId::proportional((th.font - 2.0) * scale.clamp(0.85, 1.3)),
+                                FontId::proportional((th.font - 1.5) * scale.clamp(0.85, 1.3)),
                                 th.name_color(entry),
                                 label_rect.width(),
                             );
