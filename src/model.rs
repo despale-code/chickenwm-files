@@ -48,6 +48,7 @@ pub struct Prefs {
     pub show_hidden: bool,
     pub show_preview: bool,
     pub show_extensions: bool,
+    pub icon_scale: f32,
     /// Old separate "Pinned" list; folded into `favorites` on first run.
     pub pinned: Vec<PathBuf>,
     /// The sidebar's Favorites, in order. `None` until first set up (then seeded with the
@@ -88,6 +89,7 @@ impl Default for Prefs {
             show_hidden: false,
             show_preview: true,
             show_extensions: true,
+            icon_scale: 1.0,
             pinned: Vec::new(),
             favorites: None,
         }

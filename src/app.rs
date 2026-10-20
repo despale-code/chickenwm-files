@@ -105,6 +105,8 @@ enum Action {
     Undo,
     ToggleTerminal,
     ToggleDualPane,
+    SetIconScale(f32),
+    SetSelection(Side, std::collections::HashSet<PathBuf>),
 }
 
 /// Colors and metrics from `files.css`.
@@ -303,6 +305,7 @@ pub struct FilesApp {
     address: Option<String>,
     focus_search: bool,
     drag: Option<Drag>,
+    marquee: Option<(Side, Pos2, Pos2)>,
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
     jobs: Arc<Jobs>,
@@ -487,6 +490,7 @@ impl FilesApp {
             address: None,
             focus_search: false,
             drag: None,
+            marquee: None,
             zones: Vec::new(),
             drop_menu: None,
             jobs: Arc::new(Jobs {
@@ -946,6 +950,14 @@ impl FilesApp {
                     self.apply(Action::SetView(ViewMode::Dual));
                 }
             }
+            Action::SetIconScale(scale) => {
+                self.prefs.icon_scale = scale.clamp(0.65, 2.2);
+                self.prefs.save();
+            }
+            Action::SetSelection(side, paths) => {
+                self.focus = side;
+                self.pane_mut(side).selection = paths;
+            }
         }
     }
 
@@ -1387,16 +1399,148 @@ struct Draw<'a> {
     dragging: bool,
     focused: bool,
     actions: &'a mut Vec<Action>,
+    marquee: &'a mut Option<(Side, Pos2, Pos2)>,
     /// Folder sizes and git badges for this frame.
     extras: &'a tools::RowExtras,
+}
+
+// ==================== MONOTONE VECTOR UI ICONS ====================
+
+fn paint_nav_back(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.8_f32, color);
+    let pts = [c + egui::vec2(2.5, -5.0), c + egui::vec2(-2.5, 0.0), c + egui::vec2(2.5, 5.0)];
+    painter.add(egui::Shape::line(pts.to_vec(), stroke));
+}
+
+fn paint_nav_forward(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.8_f32, color);
+    let pts = [c + egui::vec2(-2.5, -5.0), c + egui::vec2(2.5, 0.0), c + egui::vec2(-2.5, 5.0)];
+    painter.add(egui::Shape::line(pts.to_vec(), stroke));
+}
+
+fn paint_nav_up(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.8_f32, color);
+    let pts = [c + egui::vec2(-5.0, 2.5), c + egui::vec2(0.0, -2.5), c + egui::vec2(5.0, 2.5)];
+    painter.add(egui::Shape::line(pts.to_vec(), stroke));
+}
+
+fn paint_nav_refresh(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.6_f32, color);
+    let r = 4.8;
+    let n = 12;
+    let mut pts = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let angle = std::f32::consts::PI * 0.25 + (std::f32::consts::PI * 1.5) * (i as f32 / n as f32);
+        pts.push(c + egui::vec2(angle.cos() * r, angle.sin() * r));
+    }
+    painter.add(egui::Shape::line(pts, stroke));
+    let tip = c + egui::vec2((std::f32::consts::PI * 1.75).cos() * r, (std::f32::consts::PI * 1.75).sin() * r);
+    painter.add(egui::Shape::line(vec![tip + egui::vec2(-2.5, -1.0), tip, tip + egui::vec2(-0.5, 3.0)], stroke));
+}
+
+fn paint_search_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center() + egui::vec2(-1.0, -1.0);
+    let stroke = Stroke::new(1.6_f32, color);
+    painter.circle_stroke(c, 4.2, stroke);
+    let handle_start = c + egui::vec2(3.0, 3.0);
+    let handle_end = handle_start + egui::vec2(3.5, 3.5);
+    painter.line_segment([handle_start, handle_end], Stroke::new(2.0_f32, color));
+}
+
+fn paint_clear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let s = 3.5;
+    let stroke = Stroke::new(1.5_f32, color);
+    painter.line_segment([c + egui::vec2(-s, -s), c + egui::vec2(s, s)], stroke);
+    painter.line_segment([c + egui::vec2(s, -s), c + egui::vec2(-s, s)], stroke);
+}
+
+fn paint_chevron_down(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.5_f32, color);
+    let pts = [c + egui::vec2(-3.0, -1.5), c + egui::vec2(0.0, 1.8), c + egui::vec2(3.0, -1.5)];
+    painter.add(egui::Shape::line(pts.to_vec(), stroke));
+}
+
+fn paint_view_list(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.5_f32, color);
+    for dy in [-4.0, 0.0, 4.0] {
+        painter.line_segment([c + egui::vec2(-5.5, dy), c + egui::vec2(5.5, dy)], stroke);
+    }
+}
+
+fn paint_view_icons(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.4_f32, color);
+    for dx in [-5.0, 1.0] {
+        for dy in [-5.0, 1.0] {
+            painter.rect_stroke(Rect::from_min_size(c + egui::vec2(dx, dy), egui::vec2(4.0, 4.0)), CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+        }
+    }
+}
+
+fn paint_view_columns(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.4_f32, color);
+    for dx in [-6.0, -1.5, 3.0] {
+        painter.rect_stroke(Rect::from_min_size(c + egui::vec2(dx, -5.5), egui::vec2(3.0, 11.0)), CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+    }
+}
+
+fn paint_view_dual(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.4_f32, color);
+    let r = Rect::from_center_size(c, egui::vec2(12.0, 11.0));
+    painter.rect_stroke(r, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    painter.line_segment([Pos2::new(c.x, r.top()), Pos2::new(c.x, r.bottom())], stroke);
+}
+
+fn paint_preview_icon(painter: &egui::Painter, rect: Rect, color: Color32, active: bool, accent: Color32) {
+    let c = rect.center();
+    let r = Rect::from_center_size(c, egui::vec2(13.0, 11.0));
+    let stroke = Stroke::new(1.4_f32, color);
+    painter.rect_stroke(r, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    let split_x = r.right() - 4.5;
+    painter.line_segment([Pos2::new(split_x, r.top()), Pos2::new(split_x, r.bottom())], stroke);
+    if active {
+        painter.rect_filled(Rect::from_min_max(Pos2::new(split_x + 1.0, r.top() + 1.0), r.max - egui::vec2(1.0, 1.0)), CornerRadius::same(1), accent.gamma_multiply(0.4));
+    }
+}
+
+fn paint_terminal_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.6_f32, color);
+    let prompt_pts = [c + egui::vec2(-5.0, -3.5), c + egui::vec2(-1.5, -0.5), c + egui::vec2(-5.0, 2.5)];
+    painter.add(egui::Shape::line(prompt_pts.to_vec(), stroke));
+    painter.line_segment([c + egui::vec2(1.0, 3.5), c + egui::vec2(5.5, 3.5)], stroke);
+}
+
+fn paint_gear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.5_f32, color);
+    let r = 3.2;
+    painter.circle_stroke(c, r, stroke);
+    for i in 0..6 {
+        let angle = i as f32 * (std::f32::consts::PI / 3.0);
+        let p1 = c + egui::vec2(angle.cos() * (r + 0.5), angle.sin() * (r + 0.5));
+        let p2 = c + egui::vec2(angle.cos() * (r + 2.8), angle.sin() * (r + 2.8));
+        painter.line_segment([p1, p2], Stroke::new(2.2_f32, color));
+    }
 }
 
 fn paint_icon(ui: &egui::Ui, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
     if let Some(tex) = icons.get(key, large) {
         ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    } else if fallback_dir {
+        paint_view_icons(ui.painter(), rect.shrink(4.0), theme.dim);
     } else {
-        let glyph = if fallback_dir { "📁" } else { "📄" };
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(rect.height() * 0.85), theme.dim);
+        let r = Rect::from_center_size(rect.center(), egui::vec2(rect.width() * 0.65, rect.height() * 0.75));
+        ui.painter().rect_stroke(r, CornerRadius::same(2), Stroke::new(1.2_f32, theme.dim), egui::StrokeKind::Inside);
     }
 }
 
@@ -1543,10 +1687,10 @@ fn background_menu(ui: &mut egui::Ui, side: Side, cwd: &Path, prefs: &Prefs, pin
         push(ui, Action::Paste(cwd.to_path_buf()));
     }
     ui.menu_button("New", |ui| {
-        if ui.add(egui::Button::new("📁  Folder").shortcut_text("Ctrl+Shift+N")).clicked() {
+        if ui.add(egui::Button::new("New Folder").shortcut_text("Ctrl+Shift+N")).clicked() {
             push(ui, Action::NewFolder(cwd.to_path_buf()));
         }
-        if ui.button("📄  Text document").clicked() {
+        if ui.button("New Text Document").clicked() {
             push(ui, Action::NewTextFile(cwd.to_path_buf()));
         }
     });
@@ -1685,11 +1829,28 @@ impl Draw<'_> {
 
     /// Clickable empty space behind the list: clears selection, background menu, drop zone.
     fn background(&mut self, ui: &mut egui::Ui, side: Side, pane: &Pane, rect: Rect) {
-        let resp = ui.interact(rect, ui.id().with(("bg", side)), Sense::click());
-        if resp.clicked() {
-            self.actions.push(Action::ClearSelection(side));
+        let resp = ui.interact(rect, ui.id().with(("bg", side)), Sense::click_and_drag());
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                *self.marquee = Some((side, pos, pos));
+                if !ui.input(|i| i.modifiers.ctrl) {
+                    self.actions.push(Action::ClearSelection(side));
+                }
+            }
         }
-        if resp.secondary_clicked() {
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some((m_side, _, current)) = self.marquee.as_mut() {
+                if *m_side == side {
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        *current = pos;
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
+            *self.marquee = None;
+        }
+        if resp.clicked() || resp.secondary_clicked() {
             self.actions.push(Action::ClearSelection(side));
         }
         self.zones.push(DropZone { rect, dir: pane.cwd.clone() });
@@ -1752,6 +1913,18 @@ impl Draw<'_> {
         self.background(ui, side, pane, list_rect);
         self.empty_message(ui, list_rect, pane);
 
+        let mut marquee_hits = Vec::new();
+        let marquee_box = if let Some((m_side, start, current)) = *self.marquee {
+            if m_side == side {
+                let r = Rect::from_two_pos(start, current);
+                if r.width() > 3.0 || r.height() > 3.0 { Some(r) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let sa = self.scroll_area(side, "details", pane, row_h, 1, memo);
         let out = sa.show_rows(ui, row_h, pane.visible.len(), |ui, range| {
             for pos in range {
@@ -1763,6 +1936,11 @@ impl Draw<'_> {
                     ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
                 }
                 self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
+                if let Some(mbox) = marquee_box {
+                    if mbox.intersects(rect) {
+                        marquee_hits.push(entry.path.clone());
+                    }
+                }
                 let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
                 paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
                 let name_rect = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top() + 2.0), Pos2::new(rect.left() + 8.0 + name_w - 6.0, rect.bottom() - 2.0));
@@ -1807,21 +1985,67 @@ impl Draw<'_> {
                 self.interact(&resp, side, pos, entry, pane, rect, dual);
             }
         });
+        if let Some(mbox) = marquee_box {
+            ui.painter().rect_filled(mbox, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
+            ui.painter().rect_stroke(mbox, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+            if !marquee_hits.is_empty() {
+                let mut new_sel = if ui.input(|i| i.modifiers.ctrl) {
+                    pane.selection.clone()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                for p in marquee_hits {
+                    new_sel.insert(p);
+                }
+                self.actions.push(Action::SetSelection(side, new_sel));
+            }
+        }
+
         ScrollMemo { offset: out.state.offset.y, viewport: out.inner_rect.height() }
     }
 
     /// Icons view: a grid of tiles.
     fn icons_grid(&mut self, ui: &mut egui::Ui, side: Side, pane: &Pane, memo: Option<&ScrollMemo>, cols_out: &mut usize) -> ScrollMemo {
         let th = self.theme;
-        let tile = egui::vec2(108.0, 100.0);
+        let scale = self.prefs.icon_scale.clamp(0.65, 2.2);
+
+        // Alt+scrollwheel (or Ctrl+scrollwheel) zoom
+        let (zoom_in, zoom_out) = ui.input(|i| {
+            if (i.modifiers.alt || i.modifiers.ctrl) && i.raw_scroll_delta.y != 0.0 {
+                (i.raw_scroll_delta.y > 0.0, i.raw_scroll_delta.y < 0.0)
+            } else {
+                (false, false)
+            }
+        });
+        if zoom_in {
+            self.actions.push(Action::SetIconScale(scale + 0.1));
+        } else if zoom_out {
+            self.actions.push(Action::SetIconScale(scale - 0.1));
+        }
+
+        let tile = egui::vec2((114.0 * scale).round(), (104.0 * scale).round());
         let list_rect = ui.available_rect_before_wrap();
         self.background(ui, side, pane, list_rect);
         self.empty_message(ui, list_rect, pane);
-        let cols = ((list_rect.width() - 12.0) / (tile.x + 6.0)).floor().max(1.0) as usize;
+        let gap = 4.0;
+        let cols = ((list_rect.width() - 8.0) / (tile.x + gap)).floor().max(1.0) as usize;
         *cols_out = cols;
         let rows = pane.visible.len().div_ceil(cols);
-        let sa = self.scroll_area(side, "icons", pane, tile.y + 6.0, cols, memo);
-        let out = sa.show_rows(ui, tile.y + 6.0, rows, |ui, range| {
+        let sa = self.scroll_area(side, "icons", pane, tile.y + gap, cols, memo);
+
+        let mut marquee_hits = Vec::new();
+        let marquee_box = if let Some((m_side, start, current)) = *self.marquee {
+            if m_side == side {
+                let r = Rect::from_two_pos(start, current);
+                if r.width() > 3.0 || r.height() > 3.0 { Some(r) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let out = sa.show_rows(ui, tile.y + gap, rows, |ui, range| {
             for row in range {
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
@@ -1830,13 +2054,21 @@ impl Draw<'_> {
                         let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
                         let selected = pane.selection.contains(&entry.path);
                         self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
-                        let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + 30.0), Vec2::splat(40.0));
+
+                        if let Some(mbox) = marquee_box {
+                            if mbox.intersects(rect) {
+                                marquee_hits.push(entry.path.clone());
+                            }
+                        }
+
+                        let icon_size = (42.0 * scale).round();
+                        let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (26.0 * scale).round()), Vec2::splat(icon_size));
                         paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
-                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + 56.0), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
+                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 2.0, rect.top() + (52.0 * scale).round()), Pos2::new(rect.right() - 2.0, rect.bottom() - 1.0));
                         if !self.rename_field(ui, entry, Rect::from_min_size(label_rect.min, egui::vec2(label_rect.width(), 24.0))) {
                             let galley = ui.painter().layout(
                                 shown_name(entry, self.prefs),
-                                FontId::proportional(th.font - 1.0),
+                                FontId::proportional((th.font - 2.0) * scale.clamp(0.85, 1.3)),
                                 th.name_color(entry),
                                 label_rect.width(),
                             );
@@ -1849,6 +2081,23 @@ impl Draw<'_> {
                 });
             }
         });
+
+        if let Some(mbox) = marquee_box {
+            ui.painter().rect_filled(mbox, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
+            ui.painter().rect_stroke(mbox, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+            if !marquee_hits.is_empty() {
+                let mut new_sel = if ui.input(|i| i.modifiers.ctrl) {
+                    pane.selection.clone()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                for p in marquee_hits {
+                    new_sel.insert(p);
+                }
+                self.actions.push(Action::SetSelection(side, new_sel));
+            }
+        }
+
         ScrollMemo { offset: out.state.offset.y, viewport: out.inner_rect.height() }
     }
 
@@ -2059,50 +2308,57 @@ impl FilesApp {
                 let side = self.focused();
                 let pane = self.pane(side);
 
-                // 1. Navigation capsule: Back, Forward, Up, Refresh
+                // 1. Navigation capsule: Back, Forward, Up, Refresh (monotone vector icons, 28px height)
                 let nav_frame = egui::Frame::NONE
                     .fill(th.pane)
                     .corner_radius(CornerRadius::same(th.radius.min(6)))
                     .stroke(Stroke::new(1.0_f32, th.hairline()))
-                    .inner_margin(egui::Margin::symmetric(4, 2));
+                    .inner_margin(egui::Margin::symmetric(3, 2));
 
                 nav_frame.show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let nav_btn = |ui: &mut egui::Ui, glyph: &str, tip: &str, enabled: bool| {
-                        ui.add_enabled(
-                            enabled,
-                            egui::Button::new(egui::RichText::new(glyph).size(th.font).color(if enabled { th.fg } else { th.dim.gamma_multiply(0.4) }))
-                                .frame(false)
-                                .min_size(egui::vec2(22.0, 24.0)),
-                        ).on_hover_text(tip).clicked()
+                    ui.spacing_mut().item_spacing.x = 1.0;
+                    let nav_btn = |ui: &mut egui::Ui, tip: &str, enabled: bool, painter_fn: fn(&egui::Painter, Rect, Color32)| -> bool {
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), if enabled { Sense::click() } else { Sense::hover() });
+                        let color = if enabled {
+                            if resp.hovered() {
+                                ui.painter().rect_filled(rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                                th.fg
+                            } else {
+                                th.fg.gamma_multiply(0.9)
+                            }
+                        } else {
+                            th.dim.gamma_multiply(0.35)
+                        };
+                        painter_fn(ui.painter(), rect, color);
+                        resp.on_hover_text(tip).clicked()
                     };
 
-                    if nav_btn(ui, "◀", "Back (Alt+Left)", !pane.back.is_empty()) {
+                    if nav_btn(ui, "Back (Alt+Left)", !pane.back.is_empty(), paint_nav_back) {
                         actions.push(Action::Back(side));
                     }
-                    if nav_btn(ui, "▶", "Forward (Alt+Right)", !pane.forward.is_empty()) {
+                    if nav_btn(ui, "Forward (Alt+Right)", !pane.forward.is_empty(), paint_nav_forward) {
                         actions.push(Action::Forward(side));
                     }
-                    if nav_btn(ui, "▲", "Up a folder (Alt+Up / Backspace)", pane.cwd.parent().is_some()) {
+                    if nav_btn(ui, "Up a folder (Alt+Up / Backspace)", pane.cwd.parent().is_some(), paint_nav_up) {
                         actions.push(Action::Up(side));
                     }
-                    if nav_btn(ui, "↻", "Refresh (F5)", true) {
+                    if nav_btn(ui, "Refresh (F5)", true, paint_nav_refresh) {
                         actions.push(Action::Refresh);
                     }
                 });
 
                 ui.add_space(4.0);
 
-                // 2. Breadcrumbs / Address bar: compact, fits between nav capsule and right tools
-                let right_needed = 410.0;
-                let addr_w = (ui.available_width() - right_needed).clamp(90.0, 240.0);
+                // 2. Breadcrumbs / Address bar: stretches to fill all available width
+                let right_needed = 320.0;
+                let addr_w = (ui.available_width() - right_needed).max(120.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
-                // 3. Right-anchored toolbar section (Tools, Views, Search)
+                // 3. Right-anchored toolbar section (Tools, Views dropdown, Search)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
 
-                    // Quick Tools: Options Gear, Terminal, Preview
+                    // Quick Tools: Options Gear, Terminal, Preview (monotone vector icons, 28px height)
                     let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
                     let term_active = self.terminal.open;
 
@@ -2110,12 +2366,13 @@ impl FilesApp {
                         .fill(th.pane)
                         .corner_radius(CornerRadius::same(th.radius.min(6)))
                         .stroke(Stroke::new(1.0_f32, th.hairline()))
-                        .inner_margin(egui::Margin::symmetric(4, 2));
+                        .inner_margin(egui::Margin::symmetric(3, 2));
 
                     tools_frame.show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.spacing_mut().item_spacing.x = 1.0;
 
-                        ui.menu_button("⚙", |ui| {
+                        // Options Gear
+                        let menu_resp = ui.menu_button(egui::RichText::new("  ").size(th.font), |ui| {
                             let mut hidden = self.prefs.show_hidden;
                             if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
                                 actions.push(Action::ToggleHidden);
@@ -2173,39 +2430,45 @@ impl FilesApp {
                             ui.separator();
                             ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
                         });
+                        let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
+                        paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
 
-                        let term_btn = egui::Button::new(
-                            egui::RichText::new("").size(th.font).color(if term_active { th.accent } else { th.dim })
-                        )
-                        .fill(if term_active { th.accent.gamma_multiply(0.18) } else { Color32::TRANSPARENT })
-                        .frame(false)
-                        .min_size(egui::vec2(22.0, 24.0));
-                        if ui.add(term_btn).on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)").clicked() {
+                        // Terminal button
+                        let (term_r, term_resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::click());
+                        if term_active {
+                            ui.painter().rect_filled(term_r, CornerRadius::same(4), th.accent.gamma_multiply(0.18));
+                        } else if term_resp.hovered() {
+                            ui.painter().rect_filled(term_r, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                        }
+                        paint_terminal_icon(ui.painter(), term_r, if term_active { th.accent } else { th.dim });
+                        if term_resp.on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)").clicked() {
                             actions.push(Action::ToggleTerminal);
                         }
 
-                        let prev_btn = egui::Button::new(
-                            egui::RichText::new("◨").size(th.font + 1.0).color(if preview_active { th.accent } else { th.dim })
-                        )
-                        .fill(if preview_active { th.accent.gamma_multiply(0.18) } else { Color32::TRANSPARENT })
-                        .frame(false)
-                        .min_size(egui::vec2(22.0, 24.0));
-                        if ui.add(prev_btn).on_hover_text("Toggle Preview pane").clicked() {
+                        // Preview button
+                        let (prev_r, prev_resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::click());
+                        if preview_active {
+                            ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.accent.gamma_multiply(0.18));
+                        } else if prev_resp.hovered() {
+                            ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                        }
+                        paint_preview_icon(ui.painter(), prev_r, if preview_active { th.accent } else { th.dim }, preview_active, th.accent);
+                        if prev_resp.on_hover_text("Toggle Preview pane").clicked() {
                             actions.push(Action::TogglePreview);
                         }
                     });
 
-                    // View Mode Switcher
-                    if let Some(v) = view_segments(ui, th, self.prefs.view) {
+                    // View Mode Dropdown (replaces segmented view buttons)
+                    if let Some(v) = view_dropdown(ui, th, self.prefs.view) {
                         actions.push(Action::SetView(v));
                     }
 
-                    // Search Box
+                    // Search Box (monotone vector search & clear icons, unified 28px height)
                     let (filter_text, folder_title) = {
                         let pane = self.pane(side);
                         (pane.filter.clone(), pane.title())
                     };
-                    let hint = format!("🔍 Search {folder_title}…");
+                    let hint = if folder_title.is_empty() { "Search…".to_string() } else { format!("Search {folder_title}…") };
                     let mut filter_buf = filter_text;
 
                     let (resp, clear_clicked) = {
@@ -2213,22 +2476,33 @@ impl FilesApp {
                             .fill(th.pane)
                             .corner_radius(CornerRadius::same(th.radius.min(6)))
                             .stroke(Stroke::new(1.0_f32, th.hairline()))
-                            .inner_margin(egui::Margin::symmetric(6, 2));
+                            .inner_margin(egui::Margin::symmetric(4, 2));
 
                         search_frame.show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
+
+                            // In right-to-left: first item added appears on the right!
                             let clear_btn = if !filter_buf.is_empty() {
-                                ui.add(egui::Button::new(egui::RichText::new("×").size(th.font)).frame(false)).on_hover_text("Clear search").clicked()
+                                let (clr_r, clr_resp) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::click());
+                                let color = if clr_resp.hovered() { th.fg } else { th.dim };
+                                paint_clear_icon(ui.painter(), clr_r, color);
+                                clr_resp.on_hover_text("Clear search").clicked()
                             } else {
                                 false
                             };
+
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut filter_buf)
                                     .hint_text(hint)
                                     .desired_width(120.0)
                                     .frame(false)
-                                    .margin(egui::Margin::symmetric(4, 2)),
+                                    .font(FontId::proportional(th.font - 1.5))
+                                    .margin(egui::Margin::symmetric(2, 2)),
                             );
+
+                            let (ic_r, _) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::hover());
+                            paint_search_icon(ui.painter(), ic_r, th.dim);
+
                             (resp, clear_btn)
                         }).inner
                     };
@@ -2761,6 +3035,7 @@ impl FilesApp {
                 dragging,
                 focused: true,
                 actions,
+                marquee: &mut self.marquee,
                 extras: &extras,
             };
             match view {
@@ -2818,7 +3093,7 @@ impl FilesApp {
                                     ui.painter().text(tag_rect.center(), Align2::CENTER_CENTER, tag_label, FontId::proportional(th.font - 3.5), tag_color);
 
                                     let name = if title.is_empty() { display_name(path) } else { title.to_string() };
-                                    ui.label(egui::RichText::new(format!("📁 {name}")).strong().size(th.font - 1.0).color(if active { th.fg } else { th.dim }));
+                                    ui.label(egui::RichText::new(name.to_string()).strong().size(th.font - 1.0).color(if active { th.fg } else { th.dim }));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.label(egui::RichText::new(if side == Side::Main { "Left (Tab)" } else { "Right (Tab)" }).small().color(th.dim));
                                     });
@@ -2957,40 +3232,53 @@ impl FilesApp {
 }
 
 /// Finder's view switcher: one rounded group with the current view raised. Returns a new pick.
-fn view_segments(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<ViewMode> {
-    const VIEWS: [(ViewMode, &str, &str); 4] = [
-        (ViewMode::Details, "☰ List", "Details view (Ctrl+Shift+1)"),
-        (ViewMode::Icons, "▦ Icons", "Grid view (Ctrl+Shift+2)"),
-        (ViewMode::Columns, "▥ Columns", "Columns view (Ctrl+Shift+3)"),
-        (ViewMode::Dual, "◫ Dual", "Dual pane (F3 / Ctrl+D / Ctrl+Shift+4)"),
-    ];
-    let font = FontId::proportional(th.font - 2.0);
-    let widths: Vec<f32> = VIEWS
-        .iter()
-        .map(|(_, label, _)| ui.painter().layout_no_wrap(label.to_string(), font.clone(), th.fg).size().x + 10.0)
-        .collect();
-    let (group, _) = ui.allocate_exact_size(egui::vec2(widths.iter().sum::<f32>() + 4.0, 24.0), Sense::hover());
-    let radius = CornerRadius::same(th.radius.clamp(4, 6));
-    ui.painter().rect_filled(group, radius, th.pane);
-    ui.painter().rect_stroke(group, radius, Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
-    let mut x = group.left() + 2.0;
+fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<ViewMode> {
     let mut picked = None;
-    for ((view, label, tip), w) in VIEWS.iter().zip(widths) {
-        let seg = Rect::from_min_size(Pos2::new(x, group.top() + 2.0), egui::vec2(w, group.height() - 4.0));
-        x += w;
-        let resp = ui.interact(seg, ui.id().with(("view-seg", *label)), Sense::click()).on_hover_text(*tip);
-        let selected = *view == current;
-        if selected {
-            ui.painter().rect_filled(seg, CornerRadius::same(th.radius.clamp(3, 5)), th.accent.gamma_multiply(0.22));
-            ui.painter().rect_stroke(seg, CornerRadius::same(th.radius.clamp(3, 5)), Stroke::new(1.0_f32, th.accent.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(seg, CornerRadius::same(th.radius.clamp(3, 5)), th.fg.gamma_multiply(0.05));
-        }
-        ui.painter().text(seg.center(), Align2::CENTER_CENTER, *label, font.clone(), if selected { th.accent } else { th.dim });
-        if resp.clicked() && !selected {
-            picked = Some(*view);
-        }
-    }
+    let (icon_fn, title): (fn(&egui::Painter, Rect, Color32), &str) = match current {
+        ViewMode::Details => (paint_view_list, "List"),
+        ViewMode::Icons => (paint_view_icons, "Icons"),
+        ViewMode::Columns => (paint_view_columns, "Columns"),
+        ViewMode::Dual => (paint_view_dual, "Dual"),
+    };
+
+    let frame = egui::Frame::NONE
+        .fill(th.pane)
+        .corner_radius(CornerRadius::same(th.radius.min(6)))
+        .stroke(Stroke::new(1.0_f32, th.hairline()))
+        .inner_margin(egui::Margin::symmetric(4, 2));
+
+    frame.show(ui, |ui| {
+        let label = format!("     {title}   ");
+        let menu_resp = ui.menu_button(egui::RichText::new(label).size(th.font - 1.0).color(th.fg), |ui| {
+            ui.set_min_width(125.0);
+            let items = [
+                (ViewMode::Details, "List", "Ctrl+Shift+1", paint_view_list as fn(&egui::Painter, Rect, Color32)),
+                (ViewMode::Icons, "Icons", "Ctrl+Shift+2", paint_view_icons),
+                (ViewMode::Columns, "Columns", "Ctrl+Shift+3", paint_view_columns),
+                (ViewMode::Dual, "Dual", "Ctrl+Shift+4", paint_view_dual),
+            ];
+            for (vm, name, sc, p_icon) in items {
+                let active = vm == current;
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(125.0, 24.0), Sense::click());
+                if resp.hovered() || active {
+                    ui.painter().rect_filled(r, CornerRadius::same(4), if active { th.accent.gamma_multiply(0.18) } else { th.fg.gamma_multiply(0.06) });
+                }
+                let ic_r = Rect::from_min_size(r.min + egui::vec2(6.0, 4.0), egui::vec2(16.0, 16.0));
+                p_icon(ui.painter(), ic_r, if active { th.accent } else { th.fg });
+                ui.painter().text(r.min + egui::vec2(28.0, 12.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 1.0), if active { th.accent } else { th.fg });
+                ui.painter().text(r.max - egui::vec2(6.0, 12.0), Align2::RIGHT_CENTER, sc, FontId::proportional(th.font - 3.0), th.dim);
+                if resp.clicked() {
+                    picked = Some(vm);
+                    ui.close_menu();
+                }
+            }
+        });
+        let icon_rect = Rect::from_min_size(menu_resp.response.rect.min + egui::vec2(6.0, 4.0), egui::vec2(16.0, 16.0));
+        icon_fn(ui.painter(), icon_rect, if menu_resp.response.hovered() { th.accent } else { th.fg });
+        let chev_rect = Rect::from_min_size(menu_resp.response.rect.max - egui::vec2(14.0, 18.0), egui::vec2(10.0, 12.0));
+        paint_chevron_down(ui.painter(), chev_rect, if menu_resp.response.hovered() { th.accent } else { th.dim });
+    });
+
     picked
 }
 
