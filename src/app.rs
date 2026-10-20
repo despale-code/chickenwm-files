@@ -220,9 +220,9 @@ impl Theme {
         // slot (and `dark_mode` flag) can disagree with our colours, leaving the app stuck dark.
         ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
         let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
-        v.panel_fill = self.bg;
+        v.panel_fill = Color32::TRANSPARENT;
         // Acrylic frosted-glass translucent background for context menus and popups
-        let menu_bg = Color32::from_rgba_unmultiplied(self.sidebar.r(), self.sidebar.g(), self.sidebar.b(), 180);
+        let menu_bg = Color32::from_rgba_unmultiplied(self.sidebar.r(), self.sidebar.g(), self.sidebar.b(), 40);
         v.window_fill = menu_bg;
         v.extreme_bg_color = self.sidebar;
         v.faint_bg_color = self.pane;
@@ -3115,7 +3115,7 @@ impl FilesApp {
     /// reorder) and "Locations" (drives). Each section folds away from its header.
     fn draw_sidebar(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
         // Acrylic frosted-glass semi-transparent background
-        let sidebar_bg = Color32::from_rgba_unmultiplied(th.sidebar.r(), th.sidebar.g(), th.sidebar.b(), 145);
+        let sidebar_bg = Color32::from_rgba_unmultiplied(th.sidebar.r(), th.sidebar.g(), th.sidebar.b(), 26);
         let frame = egui::Frame::NONE.fill(sidebar_bg).inner_margin(egui::Margin { left: 10, right: 10, top: 0, bottom: 8 });
         egui::SidePanel::left("files_sidebar")
             .resizable(true)
