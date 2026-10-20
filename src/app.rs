@@ -2970,7 +2970,7 @@ impl FilesApp {
         egui::SidePanel::left("files_sidebar")
             .resizable(true)
             .default_width(210.0)
-            .width_range(160.0..=340.0)
+            .width_range(190.0..=340.0)
             .show_separator_line(true)
             .frame(frame)
             .show(ctx, |ui| {
@@ -3029,107 +3029,128 @@ impl FilesApp {
                     let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    let cwd = self.pane(self.focused()).cwd.clone();
-                    let side = self.focused();
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    // Pinned bottom bar: Settings gear button on bottom right
+                    ui.add_space(2.0);
+                    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 28.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let menu_resp = ui.menu_button(egui::RichText::new("   ").size(th.font), |ui| {
+                            self.settings_menu(ui, th, side, actions);
+                        });
+                        let resp = menu_resp.response.on_hover_text("Settings & View options");
+                        let gear_color = if resp.hovered() { th.fg } else { th.dim };
+                        paint_gear_icon(ui.painter(), resp.rect, gear_color);
+                    });
 
-                    let is_folder_drag = self.drag.as_ref().map_or(false, |d| d.paths.iter().any(|p| p.is_dir()));
-                    let (_, fav_factor) = self.sidebar_section(ui, th, "Favorites", &cwd, actions);
-                    if fav_factor > 0.005 {
-                        let favorites = self.prefs.favorites().to_vec();
-                        let est_h = (favorites.len().max(1) as f32 * 26.0 + 8.0) * fav_factor;
-                        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), est_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.set_clip_rect(ui.max_rect());
-                            let mut rows = Vec::with_capacity(favorites.len());
-                            let fav_start_y = ui.cursor().top();
-                            for (i, fav) in favorites.iter().enumerate() {
-                                let key = format!("path:{}", fav.path.display());
-                                let resp = self.sidebar_item(ui, th, &fav.label(), &key, &fav.path, cwd == fav.path, side, Some(i), None, actions);
-                                if resp.drag_started() && self.fav_rename.is_none() {
-                                    self.fav_drag = Some(i);
+                    // Scrollable area filling the remaining vertical space
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            let cwd = self.pane(self.focused()).cwd.clone();
+                            let side = self.focused();
+
+                            let is_folder_drag = self.drag.as_ref().map_or(false, |d| d.paths.iter().any(|p| p.is_dir()));
+                            let (_, fav_factor) = self.sidebar_section(ui, th, "Favorites", &cwd, actions);
+                            let favorites = self.prefs.favorites().to_vec();
+                            let full_fav_h = if favorites.is_empty() {
+                                26.0
+                            } else {
+                                favorites.len() as f32 * (th.row_h + 1.0) + 2.0
+                            };
+                            let fav_anim_h = full_fav_h * fav_factor;
+                            let (fav_container, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), fav_anim_h), Sense::hover());
+                            if fav_factor > 0.005 {
+                                let mut child_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(fav_container)
+                                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                                );
+                                child_ui.set_clip_rect(fav_container.intersect(ui.clip_rect()));
+                                child_ui.spacing_mut().item_spacing.y = 1.0;
+
+                                let mut rows = Vec::new();
+                                let fav_start_y = fav_container.top();
+                                for (i, fav) in favorites.iter().enumerate() {
+                                    let active = cwd == fav.path;
+                                    let key = format!("path:{}", fav.path.display());
+                                    let resp = self.sidebar_item(&mut child_ui, th, &fav.label(), &key, &fav.path, active, side, Some(i), None, actions);
+                                    if resp.drag_started() && self.fav_rename.is_none() {
+                                        self.fav_drag = Some(i);
+                                    }
+                                    rows.push(resp.rect);
                                 }
-                                rows.push(resp.rect);
-                            }
-                            if favorites.is_empty() {
-                                ui.add_space(2.0);
-                                let r = ui.label(egui::RichText::new("Add folders with + or drag them here").small().color(th.dim)).rect;
-                                rows.push(r);
-                            }
-                            let fav_end_y = ui.cursor().bottom() + 10.0;
-                            let fav_rect = Rect::from_min_max(
-                                Pos2::new(ui.min_rect().left(), fav_start_y - 24.0),
-                                Pos2::new(ui.min_rect().right(), fav_end_y),
-                            );
+                                if favorites.is_empty() {
+                                    child_ui.add_space(2.0);
+                                    let r = child_ui.label(egui::RichText::new("Add folders with + or drag them here").small().color(th.dim)).rect;
+                                    rows.push(r);
+                                }
+                                let fav_rect = Rect::from_min_max(
+                                    Pos2::new(fav_container.left(), fav_start_y - 24.0),
+                                    Pos2::new(fav_container.right(), fav_container.bottom() + 10.0),
+                                );
 
-                            // Drag folders directly into Favorites section
-                            if is_folder_drag {
-                                if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
-                                    if fav_rect.contains(pointer) {
-                                        self.fav_drop_hover = true;
-                                        let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(favorites.len());
-                                        let y = if to < rows.len() {
-                                            rows[to].top()
-                                        } else if !rows.is_empty() {
-                                            rows[rows.len() - 1].bottom()
-                                        } else {
-                                            fav_start_y
-                                        };
-                                        let left = ui.min_rect().left() + 8.0;
-                                        let right = ui.min_rect().right() - 8.0;
+                                // Drag folders directly into Favorites section
+                                if is_folder_drag {
+                                    if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+                                        if fav_rect.contains(pointer) {
+                                            self.fav_drop_hover = true;
+                                            let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(favorites.len());
+                                            let y = if to < rows.len() {
+                                                rows[to].top()
+                                            } else if !rows.is_empty() {
+                                                rows[rows.len() - 1].bottom()
+                                            } else {
+                                                fav_start_y
+                                            };
+                                            let left = ui.min_rect().left() + 8.0;
+                                            let right = ui.min_rect().right() - 8.0;
 
-                                        // Visual drop indicator line & circle
-                                        ui.painter().line_segment([Pos2::new(left + 6.0, y), Pos2::new(right, y)], Stroke::new(2.5_f32, th.accent));
-                                        ui.painter().circle_filled(Pos2::new(left + 4.0, y), 3.5, th.accent);
+                                            // Visual drop indicator line & circle
+                                            ui.painter().line_segment([Pos2::new(left + 6.0, y), Pos2::new(right, y)], Stroke::new(2.5_f32, th.accent));
+                                            ui.painter().circle_filled(Pos2::new(left + 4.0, y), 3.5, th.accent);
 
-                                        // Drop onto Favorites
-                                        if ui.input(|i| i.pointer.any_released()) {
-                                            if let Some(drag) = self.drag.take() {
-                                                let mut insert_idx = to;
-                                                for p in drag.paths {
-                                                    if p.is_dir() {
-                                                        actions.push(Action::PinAt { path: p, index: insert_idx });
-                                                        insert_idx += 1;
+                                            // Drop onto Favorites
+                                            if ui.input(|i| i.pointer.any_released()) {
+                                                if let Some(drag) = self.drag.take() {
+                                                    let mut insert_idx = to;
+                                                    for p in drag.paths {
+                                                        if p.is_dir() {
+                                                            actions.push(Action::PinAt { path: p, index: insert_idx });
+                                                            insert_idx += 1;
+                                                        }
                                                     }
+                                                    self.toast("Added to Favorites", false);
                                                 }
-                                                self.toast("Added to Favorites", false);
                                             }
                                         }
                                     }
                                 }
+
+                                self.favorite_reorder(ui, th, &rows, &favorites, actions);
                             }
 
-                            self.favorite_reorder(ui, th, &rows, &favorites, actions);
-                        });
-                    }
-
-                    ui.add_space(10.0);
-                    let (_, loc_factor) = self.sidebar_section(ui, th, "Locations", &cwd, actions);
-                    if loc_factor > 0.005 {
-                        let drives: Vec<(PathBuf, String, Option<(u64, u64)>)> =
-                            self.drives.iter().map(|d| (d.root.clone(), d.label.clone(), d.space)).collect();
-                        let est_h = (drives.len().max(1) as f32 * 26.0 + 8.0) * loc_factor;
-                        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), est_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.set_clip_rect(ui.max_rect());
-                            for (root, label, space) in drives {
-                                let letter = root.display().to_string().trim_end_matches('\\').to_string();
-                                let name = format!("{label} ({letter})");
-                                let key = format!("path:{}", root.display());
-                                self.sidebar_item(ui, th, &name, &key, &root, cwd == root, side, None, space, actions);
+                            ui.add_space(10.0);
+                            let (_, loc_factor) = self.sidebar_section(ui, th, "Locations", &cwd, actions);
+                            let drives: Vec<(PathBuf, String, Option<(u64, u64)>)> =
+                                self.drives.iter().map(|d| (d.root.clone(), d.label.clone(), d.space)).collect();
+                            let full_loc_h = drives.len() as f32 * (th.row_h + 11.0) + 2.0;
+                            let loc_anim_h = full_loc_h * loc_factor;
+                            let (loc_container, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), loc_anim_h), Sense::hover());
+                            if loc_factor > 0.005 {
+                                let mut child_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(loc_container)
+                                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                                );
+                                child_ui.set_clip_rect(loc_container.intersect(ui.clip_rect()));
+                                child_ui.spacing_mut().item_spacing.y = 1.0;
+                                for (root, label, space) in drives {
+                                    let letter = root.display().to_string().trim_end_matches('\\').to_string();
+                                    let name = format!("{label} ({letter})");
+                                    let key = format!("path:{}", root.display());
+                                    self.sidebar_item(&mut child_ui, th, &name, &key, &root, cwd == root, side, None, space, actions);
+                                }
                             }
                         });
-                    }
-                });
-
-                // Bottom bar inside left sidebar: Settings gear button on bottom right
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let menu_resp = ui.menu_button(egui::RichText::new("  ").size(th.font), |ui| {
-                            self.settings_menu(ui, th, side, actions);
-                        });
-                        let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
-                        paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
                     });
                 });
             });
@@ -3225,6 +3246,7 @@ impl FilesApp {
             th.dim,
         );
         let mut x = rect.right() - 4.0;
+        let mut plus_clicked = false;
         if favorites && hovered {
             let plus = Rect::from_center_size(Pos2::new(x - 9.0, rect.center().y), Vec2::splat(18.0));
             let plus_resp = ui.interact(plus, ui.id().with("fav-add"), Sense::click());
@@ -3234,6 +3256,7 @@ impl FilesApp {
             ui.painter().text(plus.center(), Align2::CENTER_CENTER, "+", FontId::proportional(th.font + 1.0), th.dim);
             if plus_resp.on_hover_text("Add this folder to Favorites").clicked() {
                 actions.push(Action::Pin(cwd.to_path_buf()));
+                plus_clicked = true;
             }
             x -= 22.0;
         }
@@ -3246,7 +3269,7 @@ impl FilesApp {
                 th.dim,
             );
         }
-        if resp.clicked() {
+        if resp.clicked() && !plus_clicked {
             if collapsed {
                 self.sidebar_collapsed.remove(title);
             } else {
@@ -3759,6 +3782,50 @@ impl FilesApp {
             }
         }
 
+        // Smooth snap-back animation when item is not moved elsewhere
+        if let Some(anim) = &self.snap_back {
+            let t = (anim.start_time.elapsed().as_secs_f32() / anim.duration.as_secs_f32()).clamp(0.0, 1.0);
+            if t < 1.0 {
+                let ease = 1.0 - (1.0 - t).powi(3); // smooth cubic ease out
+                let cur_min = anim.start_rect.min.lerp(anim.target_rect.min, ease);
+                let cur_rect = Rect::from_min_size(cur_min, anim.target_rect.size());
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("snapback")));
+
+                // Floating tile shadow & background (fading out)
+                let alpha = (60.0 * (1.0 - ease)) as u8;
+                painter.rect_filled(cur_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(alpha));
+                painter.rect_filled(cur_rect, CornerRadius::same(th.radius.min(8)), th.pane);
+                painter.rect_stroke(cur_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.2_f32, th.accent.gamma_multiply(1.0 - ease)), egui::StrokeKind::Inside);
+
+                // Icon
+                let icon_size = (cur_rect.height() * 0.46).clamp(24.0, 52.0);
+                let icon_y = cur_rect.top() + icon_size * 0.5 + 8.0;
+                let icon_rect = Rect::from_center_size(Pos2::new(cur_rect.center().x, icon_y), Vec2::splat(icon_size));
+                paint_icon_painter(&painter, &mut self.icons, &anim.icon_key, true, icon_rect, anim.is_dir, &th);
+
+                // Label
+                let font_size = (th.font - 1.5).max(10.0);
+                let mut job = egui::text::LayoutJob::simple(
+                    anim.name.clone(),
+                    FontId::proportional(font_size),
+                    th.fg,
+                    (cur_rect.width() - 8.0).max(40.0),
+                );
+                job.wrap.max_rows = 2;
+                job.wrap.overflow_character = Some('…');
+                job.halign = egui::Align::Center;
+                let galley = ctx.fonts(|f| f.layout_job(job));
+                let lx = cur_rect.center().x - galley.size().x / 2.0;
+                let ly = (icon_rect.bottom() + 4.0).min(cur_rect.bottom() - 16.0);
+                painter.galley(Pos2::new(lx, ly), galley, th.fg);
+
+                ctx.request_repaint();
+            } else {
+                self.snap_back = None;
+                ctx.request_repaint();
+            }
+        }
+
         let Some(drag) = &self.drag else { return };
         // Left the window while still holding the button: hand over to Windows drag and drop.
         let outside = !has_pointer || pointer.is_some_and(|p| !screen.shrink(2.0).contains(p));
@@ -3870,49 +3937,6 @@ impl FilesApp {
             }
         }
 
-        // Smooth snap-back animation when item is not moved elsewhere
-        if let Some(anim) = &self.snap_back {
-            let t = (anim.start_time.elapsed().as_secs_f32() / anim.duration.as_secs_f32()).clamp(0.0, 1.0);
-            if t < 1.0 {
-                let ease = 1.0 - (1.0 - t).powi(3); // smooth cubic ease out
-                let cur_min = anim.start_rect.min.lerp(anim.target_rect.min, ease);
-                let cur_rect = Rect::from_min_size(cur_min, anim.target_rect.size());
-                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("snapback")));
-
-                // Floating tile shadow & background (fading out)
-                let alpha = (60.0 * (1.0 - ease)) as u8;
-                painter.rect_filled(cur_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(alpha));
-                painter.rect_filled(cur_rect, CornerRadius::same(th.radius.min(8)), th.pane);
-                painter.rect_stroke(cur_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.2_f32, th.accent.gamma_multiply(1.0 - ease)), egui::StrokeKind::Inside);
-
-                // Icon
-                let icon_size = (cur_rect.height() * 0.46).clamp(24.0, 52.0);
-                let icon_y = cur_rect.top() + icon_size * 0.5 + 8.0;
-                let icon_rect = Rect::from_center_size(Pos2::new(cur_rect.center().x, icon_y), Vec2::splat(icon_size));
-                paint_icon_painter(&painter, &mut self.icons, &anim.icon_key, true, icon_rect, anim.is_dir, &th);
-
-                // Label
-                let font_size = (th.font - 1.5).max(10.0);
-                let mut job = egui::text::LayoutJob::simple(
-                    anim.name.clone(),
-                    FontId::proportional(font_size),
-                    th.fg,
-                    (cur_rect.width() - 8.0).max(40.0),
-                );
-                job.wrap.max_rows = 2;
-                job.wrap.overflow_character = Some('…');
-                job.halign = egui::Align::Center;
-                let galley = ctx.fonts(|f| f.layout_job(job));
-                let lx = cur_rect.center().x - galley.size().x / 2.0;
-                let ly = (icon_rect.bottom() + 4.0).min(cur_rect.bottom() - 16.0);
-                painter.galley(Pos2::new(lx, ly), galley, th.fg);
-
-                ctx.request_repaint();
-            } else {
-                self.snap_back = None;
-                ctx.request_repaint();
-            }
-        }
     }
 }
 
