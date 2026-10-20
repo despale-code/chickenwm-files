@@ -1650,7 +1650,7 @@ mod archive_tests {
         }
         let items = list_archive(&dir.join("t.7z")).unwrap();
         assert!(items.iter().any(|i| i.path == "in/sub/b.txt" && !i.is_dir));
-        let out = extract_member(&dir.join("t.7z"), "in/sub/b.txt", &dir.join("out")).unwrap();
+        let out = extract_archive_member(&dir.join("t.7z"), "in/sub/b.txt", false, &dir.join("out")).unwrap();
         assert_eq!(std::fs::read_to_string(out).unwrap(), "yo");
         let _ = std::fs::remove_dir_all(dir);
     }

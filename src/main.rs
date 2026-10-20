@@ -180,7 +180,16 @@ fn main() -> Result<()> {
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                     let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
-                    chickenwm_core::sys::apply_acrylic(hwnd, None);
+                    chickenwm_core::sys::apply_acrylic(hwnd, None);
+                    let corner = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
+                    let _ = unsafe {
+                        windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                            hwnd,
+                            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+                            &corner as *const _ as *const _,
+                            std::mem::size_of_val(&corner) as u32,
+                        )
+                    };
                 }
             }
             Ok(Box::new(app::FilesApp::new(cc, initial_dir, initial_select, css, target_fps)))

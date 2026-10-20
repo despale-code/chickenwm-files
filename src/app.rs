@@ -199,7 +199,7 @@ impl Theme {
                 }
                 b
             },
-            radius: sheet.var_px("--border-radius", 8.0).clamp(0.0, 16.0) as u8,
+            radius: sheet.var_px("--border-radius", 12.0).clamp(0.0, 24.0) as u8,
             row_h: sheet.var_px("--row-height", 28.0).clamp(20.0, 48.0),
             font: sheet.var_px("--font-size", 14.0).clamp(10.0, 22.0),
         }
@@ -547,7 +547,14 @@ fn default_drop_kind(sources: &[PathBuf], dest: &Path, mods: egui::Modifiers) ->
 fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|| {
+            let s = path.display().to_string();
+            if s.ends_with('\\') && s.len() > 1 {
+                s.trim_end_matches('\\').to_string()
+            } else {
+                s
+            }
+        })
 }
 
 fn quick_access() -> Vec<(String, PathBuf)> {
@@ -1627,18 +1634,19 @@ struct Draw<'a> {
 
 pub(super) fn paint_nav_back(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.8_f32, color);
-    let pts = [c + egui::vec2(2.5, -5.0), c + egui::vec2(-2.5, 0.0), c + egui::vec2(2.5, 5.0)];
+    let stroke = Stroke::new(2.0_f32, color);
+    let pts = [c + egui::vec2(3.0, -5.5), c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 5.5)];
     painter.add(egui::Shape::line(pts.to_vec(), stroke));
 }
 
 fn paint_nav_forward(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
-    let stroke = Stroke::new(1.8_f32, color);
-    let pts = [c + egui::vec2(-2.5, -5.0), c + egui::vec2(2.5, 0.0), c + egui::vec2(-2.5, 5.0)];
+    let stroke = Stroke::new(2.0_f32, color);
+    let pts = [c + egui::vec2(-3.0, -5.5), c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 5.5)];
     painter.add(egui::Shape::line(pts.to_vec(), stroke));
 }
 
+#[allow(dead_code)]
 fn paint_nav_up(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.8_f32, color);
@@ -1678,6 +1686,7 @@ fn paint_clear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.line_segment([c + egui::vec2(s, -s), c + egui::vec2(-s, s)], stroke);
 }
 
+#[allow(dead_code)]
 fn paint_chevron_down(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.5_f32, color);
@@ -1685,6 +1694,7 @@ fn paint_chevron_down(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.add(egui::Shape::line(pts.to_vec(), stroke));
 }
 
+#[allow(dead_code)]
 fn paint_view_list(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.5_f32, color);
@@ -1703,6 +1713,7 @@ fn paint_view_icons(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
+#[allow(dead_code)]
 fn paint_view_columns(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.4_f32, color);
@@ -1711,6 +1722,7 @@ fn paint_view_columns(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
+#[allow(dead_code)]
 fn paint_view_dual(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.4_f32, color);
@@ -1731,6 +1743,7 @@ fn paint_preview_icon(painter: &egui::Painter, rect: Rect, color: Color32, activ
     }
 }
 
+#[allow(dead_code)]
 fn paint_terminal_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.6_f32, color);
@@ -2371,12 +2384,12 @@ impl Draw<'_> {
                                     label_rect.width(),
                                 );
                                 job.wrap.max_rows = 2;
+                                job.wrap.break_anywhere = true;
                                 job.wrap.overflow_character = Some('…');
                                 job.halign = egui::Align::Center;
                                 let galley = ui.fonts(|f| f.layout_job(job));
                                 let painter = ui.painter().with_clip_rect(label_rect);
-                                let x = label_rect.center().x - galley.size().x / 2.0;
-                                painter.galley(Pos2::new(x, label_rect.top()), galley, th.fg);
+                                painter.galley(Pos2::new(label_rect.center().x, label_rect.top()), galley, th.fg);
                             }
                         }
                         self.interact(&resp, side, pos, entry, pane, rect, false);
@@ -2517,6 +2530,10 @@ impl eframe::App for FilesApp {
         self.export_here_dialog(ctx, theme);
         self.handle_drag_and_drop(ctx, theme, &mut actions);
 
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("window_outer_border")));
+        painter.rect_stroke(screen, CornerRadius::same(theme.radius), Stroke::new(1.0_f32, theme.hairline().gamma_multiply(0.4)), egui::StrokeKind::Inside);
+
         for a in actions {
             self.apply(a);
         }
@@ -2538,51 +2555,23 @@ impl FilesApp {
 
             ui.horizontal(|ui| {
                 let side = self.focused();
-                let pane = self.pane(side);
 
-                // 1. Navigation capsule: Back, Forward, Up, Refresh (monotone vector icons, 28px height)
-                let nav_frame = egui::Frame::NONE
-                    .fill(th.pane)
-                    .corner_radius(CornerRadius::same(th.radius.min(6)))
-                    .stroke(Stroke::new(1.0_f32, th.hairline()))
-                    .inner_margin(egui::Margin::symmetric(3, 2));
 
-                nav_frame.show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.x = 1.0;
-                    let nav_btn = |ui: &mut egui::Ui, tip: &str, enabled: bool, painter_fn: fn(&egui::Painter, Rect, Color32)| -> bool {
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), if enabled { Sense::click() } else { Sense::hover() });
-                        let color = if enabled {
-                            if resp.hovered() {
-                                ui.painter().rect_filled(rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
-                                th.fg
-                            } else {
-                                th.fg.gamma_multiply(0.9)
-                            }
-                        } else {
-                            th.dim.gamma_multiply(0.35)
-                        };
-                        painter_fn(ui.painter(), rect, color);
-                        resp.on_hover_text(tip).clicked()
-                    };
-
-                    if nav_btn(ui, "Back (Alt+Left)", !pane.back.is_empty(), paint_nav_back) {
-                        actions.push(Action::Back(side));
-                    }
-                    if nav_btn(ui, "Forward (Alt+Right)", !pane.forward.is_empty(), paint_nav_forward) {
-                        actions.push(Action::Forward(side));
-                    }
-                    if nav_btn(ui, "Up a folder (Alt+Up / Backspace)", pane.cwd.parent().is_some(), paint_nav_up) {
-                        actions.push(Action::Up(side));
-                    }
-                    if nav_btn(ui, "Refresh (F5)", true, paint_nav_refresh) {
-                        actions.push(Action::Refresh);
-                    }
-                });
+                // Refresh button (borderless)
+                let (ref_rect, ref_resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
+                if ref_resp.hovered() {
+                    ui.painter().rect_filled(ref_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                }
+                let ref_col = if ref_resp.hovered() { th.fg } else { th.dim };
+                paint_nav_refresh(ui.painter(), ref_rect, ref_col);
+                if ref_resp.on_hover_text("Refresh (F5)").clicked() {
+                    actions.push(Action::Refresh);
+                }
 
                 ui.add_space(4.0);
 
-                // 2. Breadcrumbs / Address bar: stretches to meet the right toolbar exactly
-                let right_needed = 480.0;
+                // Breadcrumbs / Address bar: stretches to meet the right toolbar exactly
+                let right_needed = 400.0;
                 let addr_w = (ui.available_width() - right_needed).max(120.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
@@ -2746,21 +2735,35 @@ impl FilesApp {
                         }
                     }
 
-                    // Quick Tools: Options Gear, Terminal, Preview (monotone vector icons, 28px height)
+                    // Quick Tools: Options Gear, Preview (monotone vector icons, 28px height, borderless)
                     let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
-                    let term_active = self.terminal.open;
 
                     let tools_frame = egui::Frame::NONE
                         .fill(th.pane)
                         .corner_radius(CornerRadius::same(th.radius.min(6)))
-                        .stroke(Stroke::new(1.0_f32, th.hairline()))
-                        .inner_margin(egui::Margin::symmetric(3, 2));
+                        .stroke(Stroke::NONE)
+                        .inner_margin(egui::Margin::symmetric(2, 2));
 
                     tools_frame.show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 1.0;
+                        ui.spacing_mut().item_spacing.x = 2.0;
 
                         // Options Gear
                         let menu_resp = ui.menu_button(egui::RichText::new("  ").size(th.font), |ui| {
+                            // View Mode list inside settings menu
+                            ui.label(egui::RichText::new("View mode").small().color(th.dim));
+                            for (m, label) in [
+                                (ViewMode::Details, "List / Details"),
+                                (ViewMode::Icons, "Icons"),
+                                (ViewMode::Columns, "Columns"),
+                                (ViewMode::Dual, "Dual pane"),
+                            ] {
+                                if ui.radio(self.prefs.view == m, label).clicked() {
+                                    actions.push(Action::SetView(m));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+
                             let mut hidden = self.prefs.show_hidden;
                             if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
                                 actions.push(Action::ToggleHidden);
@@ -2821,18 +2824,6 @@ impl FilesApp {
                         let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
                         paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
 
-                        // Terminal button
-                        let (term_r, term_resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::click());
-                        if term_active {
-                            ui.painter().rect_filled(term_r, CornerRadius::same(4), th.accent.gamma_multiply(0.18));
-                        } else if term_resp.hovered() {
-                            ui.painter().rect_filled(term_r, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
-                        }
-                        paint_terminal_icon(ui.painter(), term_r, if term_active { th.accent } else { th.dim });
-                        if term_resp.on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)").clicked() {
-                            actions.push(Action::ToggleTerminal);
-                        }
-
                         // Preview button
                         let (prev_r, prev_resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::click());
                         if preview_active {
@@ -2846,11 +2837,6 @@ impl FilesApp {
                         }
                     });
 
-                    // View Mode Dropdown
-                    if let Some(v) = view_dropdown(ui, th, self.prefs.view) {
-                        actions.push(Action::SetView(v));
-                    }
-
                     // Search Box (monotone vector search & clear icons, unified 28px height)
                     let (filter_text, folder_title) = {
                         let pane = self.pane(side);
@@ -2863,7 +2849,7 @@ impl FilesApp {
                         let search_frame = egui::Frame::NONE
                             .fill(th.pane)
                             .corner_radius(CornerRadius::same(th.radius.min(6)))
-                            .stroke(Stroke::new(1.0_f32, th.hairline()))
+                            .stroke(Stroke::NONE)
                             .inner_margin(egui::Margin::symmetric(4, 2));
 
                         search_frame.show(ui, |ui| {
@@ -2937,6 +2923,7 @@ impl FilesApp {
 
     fn address_bar(&mut self, ui: &mut egui::Ui, side: Side, width: f32, th: Theme, actions: &mut Vec<Action>) {
         let height = 28.0;
+        let cwd = self.pane(side).cwd.clone();
         if let Some(text) = &mut self.address {
             let id = egui::Id::new("address_edit");
             let resp = ui.add(egui::TextEdit::singleline(text).id(id).desired_width(width).margin(egui::Margin::symmetric(8, 5)));
@@ -2958,18 +2945,29 @@ impl FilesApp {
             }
             return;
         }
-        let cwd = self.pane(side).cwd.clone();
+
         let (rect, bg_resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
-        ui.painter().rect(rect, CornerRadius::same(th.radius.min(8)), th.pane, Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
-        if bg_resp.clicked() {
+        // No borders for individual navbar items
+        ui.painter().rect(rect, CornerRadius::same(th.radius.min(8)), th.pane, Stroke::NONE, egui::StrokeKind::Inside);
+
+        // Right-click anywhere on navigation enables direct path edit
+        if bg_resp.secondary_clicked() {
+            self.address = Some(cwd.display().to_string());
+        } else if bg_resp.clicked() {
             actions.push(Action::EditAddress);
+        } else if bg_resp.middle_clicked() {
+            let p = cwd.display().to_string();
+            ui.ctx().copy_text(p.clone());
+            self.toast(format!("Copied: {p}"), false);
         }
-        bg_resp.on_hover_text("Click to type a path (Ctrl+L)");
+
+        bg_resp.on_hover_text("Click to type path (Ctrl+L) · Right-click to edit · Middle-click to copy");
+
         let mut crumbs: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
         crumbs.reverse();
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(6.0, 2.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
         child.set_clip_rect(rect.shrink(1.0));
-        // When the path is too long, drop leading segments (they stay reachable via Up / typing).
+        // When the path is too long, drop leading segments
         let mut start = 0;
         let approx = |p: &PathBuf| display_name(p).len() as f32 * th.font * 0.6 + 22.0;
         while start + 1 < crumbs.len() && crumbs[start..].iter().map(approx).sum::<f32>() > width - 20.0 {
@@ -2984,26 +2982,45 @@ impl FilesApp {
             }
             let last = i + 1 == crumbs.len();
             let name = display_name(crumb);
-            let resp = child.add(egui::Button::new(egui::RichText::new(name).color(if last { th.fg } else { th.dim })).frame(false));
-            if resp.clicked() {
+            let text_galley = child.fonts(|f| f.layout_no_wrap(name.clone(), FontId::proportional(th.font - 0.5), th.fg));
+            let btn_size = egui::vec2(text_galley.size().x + 10.0, 22.0);
+            let (b_rect, resp) = child.allocate_exact_size(btn_size, Sense::click());
+
+            let hovered = resp.hovered();
+            if hovered {
+                child.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                child.painter().rect_filled(b_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.09));
+            }
+
+            let text_col = if hovered {
+                Color32::WHITE
+            } else if last {
+                th.fg
+            } else {
+                th.dim
+            };
+            child.painter().text(b_rect.center(), Align2::CENTER_CENTER, name, FontId::proportional(th.font - 0.5), text_col);
+
+            // Right click: direct path edit
+            if resp.secondary_clicked() {
+                self.address = Some(cwd.display().to_string());
+            }
+            // Middle click: copy path to clipboard
+            else if resp.middle_clicked() {
+                let p = crumb.display().to_string();
+                child.ctx().copy_text(p.clone());
+                self.toast(format!("Copied: {p}"), false);
+            }
+            // Ctrl + Left click: open path in terminal
+            else if resp.clicked() && child.input(|i| i.modifiers.ctrl) {
+                actions.push(Action::Terminal(crumb.clone()));
+            }
+            // Left click: navigate to that folder
+            else if resp.clicked() {
                 actions.push(Action::Navigate(side, crumb.clone()));
             }
-            self.zones.push(DropZone { rect: resp.rect, dir: crumb.clone() });
-            let crumb = crumb.clone();
-            resp.context_menu(|ui| {
-                if ui.button("Open in new tab").clicked() {
-                    actions.push(Action::OpenNewTab(crumb.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("Copy address").clicked() {
-                    actions.push(Action::CopyPath(vec![crumb.clone()]));
-                    ui.close_menu();
-                }
-                if ui.button("Properties").clicked() {
-                    actions.push(Action::Properties(vec![crumb.clone()]));
-                    ui.close_menu();
-                }
-            });
+
+            self.zones.push(DropZone { rect: b_rect, dir: crumb.clone() });
         }
     }
 
@@ -3105,8 +3122,54 @@ impl FilesApp {
             .show_separator_line(true)
             .frame(frame)
             .show(ctx, |ui| {
-                // Top drag region matching navbar height (~38px)
-                let (_, drag_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::drag());
+                // Top header matching navbar height (~38px)
+                // Left: Back and Forward buttons side-by-side
+                let side = self.focused();
+                let pane = self.pane(side);
+                let (top_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::hover());
+                let btn_size = egui::vec2(24.0, 24.0);
+                let btn_y = top_rect.center().y - 12.0;
+
+                let back_rect = Rect::from_min_size(Pos2::new(top_rect.left() + 2.0, btn_y), btn_size);
+                let fwd_rect = Rect::from_min_size(Pos2::new(back_rect.right() + 4.0, btn_y), btn_size);
+
+                let back_enabled = !pane.back.is_empty();
+                let back_resp = ui.interact(back_rect, ui.id().with("sidebar_back"), if back_enabled { Sense::click() } else { Sense::hover() });
+                let back_col = if back_enabled {
+                    if back_resp.hovered() {
+                        ui.painter().rect_filled(back_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                        th.fg
+                    } else {
+                        th.fg.gamma_multiply(0.9)
+                    }
+                } else {
+                    th.dim.gamma_multiply(0.65)
+                };
+                paint_nav_back(ui.painter(), back_rect, back_col);
+                if back_resp.on_hover_text("Back (Alt+Left)").clicked() {
+                    actions.push(Action::Back(side));
+                }
+
+                let fwd_enabled = !pane.forward.is_empty();
+                let fwd_resp = ui.interact(fwd_rect, ui.id().with("sidebar_fwd"), if fwd_enabled { Sense::click() } else { Sense::hover() });
+                let fwd_col = if fwd_enabled {
+                    if fwd_resp.hovered() {
+                        ui.painter().rect_filled(fwd_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                        th.fg
+                    } else {
+                        th.fg.gamma_multiply(0.9)
+                    }
+                } else {
+                    th.dim.gamma_multiply(0.65)
+                };
+                paint_nav_forward(ui.painter(), fwd_rect, fwd_col);
+                if fwd_resp.on_hover_text("Forward (Alt+Right)").clicked() {
+                    actions.push(Action::Forward(side));
+                }
+
+                // Window drag on the rest of the top bar
+                let drag_rect = Rect::from_min_max(Pos2::new(fwd_rect.right() + 6.0, top_rect.top()), top_rect.max);
+                let drag_resp = ui.interact(drag_rect, ui.id().with("sidebar_drag"), Sense::drag());
                 if drag_resp.drag_started() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
@@ -3120,79 +3183,89 @@ impl FilesApp {
                     let side = self.focused();
 
                     let is_folder_drag = self.drag.as_ref().map_or(false, |d| d.paths.iter().any(|p| p.is_dir()));
-                    if self.sidebar_section(ui, th, "Favorites", &cwd, actions) {
+                    let (_, fav_factor) = self.sidebar_section(ui, th, "Favorites", &cwd, actions);
+                    if fav_factor > 0.005 {
                         let favorites = self.prefs.favorites().to_vec();
-                        let mut rows = Vec::with_capacity(favorites.len());
-                        let fav_start_y = ui.cursor().top();
-                        for (i, fav) in favorites.iter().enumerate() {
-                            let key = format!("path:{}", fav.path.display());
-                            let resp = self.sidebar_item(ui, th, &fav.label(), &key, &fav.path, cwd == fav.path, side, Some(i), None, actions);
-                            if resp.drag_started() && self.fav_rename.is_none() {
-                                self.fav_drag = Some(i);
+                        let est_h = (favorites.len().max(1) as f32 * 26.0 + 8.0) * fav_factor;
+                        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), est_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            let mut rows = Vec::with_capacity(favorites.len());
+                            let fav_start_y = ui.cursor().top();
+                            for (i, fav) in favorites.iter().enumerate() {
+                                let key = format!("path:{}", fav.path.display());
+                                let resp = self.sidebar_item(ui, th, &fav.label(), &key, &fav.path, cwd == fav.path, side, Some(i), None, actions);
+                                if resp.drag_started() && self.fav_rename.is_none() {
+                                    self.fav_drag = Some(i);
+                                }
+                                rows.push(resp.rect);
                             }
-                            rows.push(resp.rect);
-                        }
-                        if favorites.is_empty() {
-                            ui.add_space(2.0);
-                            let r = ui.label(egui::RichText::new("Add folders with + or drag them here").small().color(th.dim)).rect;
-                            rows.push(r);
-                        }
-                        let fav_end_y = ui.cursor().bottom() + 10.0;
-                        let fav_rect = Rect::from_min_max(
-                            Pos2::new(ui.min_rect().left(), fav_start_y - 24.0),
-                            Pos2::new(ui.min_rect().right(), fav_end_y),
-                        );
+                            if favorites.is_empty() {
+                                ui.add_space(2.0);
+                                let r = ui.label(egui::RichText::new("Add folders with + or drag them here").small().color(th.dim)).rect;
+                                rows.push(r);
+                            }
+                            let fav_end_y = ui.cursor().bottom() + 10.0;
+                            let fav_rect = Rect::from_min_max(
+                                Pos2::new(ui.min_rect().left(), fav_start_y - 24.0),
+                                Pos2::new(ui.min_rect().right(), fav_end_y),
+                            );
 
-                        // Drag folders directly into Favorites section
-                        if is_folder_drag {
-                            if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
-                                if fav_rect.contains(pointer) {
-                                    self.fav_drop_hover = true;
-                                    let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(favorites.len());
-                                    let y = if to < rows.len() {
-                                        rows[to].top()
-                                    } else if !rows.is_empty() {
-                                        rows[rows.len() - 1].bottom()
-                                    } else {
-                                        fav_start_y
-                                    };
-                                    let left = ui.min_rect().left() + 8.0;
-                                    let right = ui.min_rect().right() - 8.0;
+                            // Drag folders directly into Favorites section
+                            if is_folder_drag {
+                                if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+                                    if fav_rect.contains(pointer) {
+                                        self.fav_drop_hover = true;
+                                        let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(favorites.len());
+                                        let y = if to < rows.len() {
+                                            rows[to].top()
+                                        } else if !rows.is_empty() {
+                                            rows[rows.len() - 1].bottom()
+                                        } else {
+                                            fav_start_y
+                                        };
+                                        let left = ui.min_rect().left() + 8.0;
+                                        let right = ui.min_rect().right() - 8.0;
 
-                                    // Visual drop indicator line & circle
-                                    ui.painter().line_segment([Pos2::new(left + 6.0, y), Pos2::new(right, y)], Stroke::new(2.5_f32, th.accent));
-                                    ui.painter().circle_filled(Pos2::new(left + 4.0, y), 3.5, th.accent);
+                                        // Visual drop indicator line & circle
+                                        ui.painter().line_segment([Pos2::new(left + 6.0, y), Pos2::new(right, y)], Stroke::new(2.5_f32, th.accent));
+                                        ui.painter().circle_filled(Pos2::new(left + 4.0, y), 3.5, th.accent);
 
-                                    // Drop onto Favorites
-                                    if ui.input(|i| i.pointer.any_released()) {
-                                        if let Some(drag) = self.drag.take() {
-                                            let mut insert_idx = to;
-                                            for p in drag.paths {
-                                                if p.is_dir() {
-                                                    actions.push(Action::PinAt { path: p, index: insert_idx });
-                                                    insert_idx += 1;
+                                        // Drop onto Favorites
+                                        if ui.input(|i| i.pointer.any_released()) {
+                                            if let Some(drag) = self.drag.take() {
+                                                let mut insert_idx = to;
+                                                for p in drag.paths {
+                                                    if p.is_dir() {
+                                                        actions.push(Action::PinAt { path: p, index: insert_idx });
+                                                        insert_idx += 1;
+                                                    }
                                                 }
+                                                self.toast("Added to Favorites", false);
                                             }
-                                            self.toast("Added to Favorites", false);
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        self.favorite_reorder(ui, th, &rows, &favorites, actions);
+                            self.favorite_reorder(ui, th, &rows, &favorites, actions);
+                        });
                     }
 
                     ui.add_space(10.0);
-                    if self.sidebar_section(ui, th, "Locations", &cwd, actions) {
+                    let (_, loc_factor) = self.sidebar_section(ui, th, "Locations", &cwd, actions);
+                    if loc_factor > 0.005 {
                         let drives: Vec<(PathBuf, String, Option<(u64, u64)>)> =
                             self.drives.iter().map(|d| (d.root.clone(), d.label.clone(), d.space)).collect();
-                        for (root, label, space) in drives {
-                            let letter = root.display().to_string().trim_end_matches('\\').to_string();
-                            let name = format!("{label} ({letter})");
-                            let key = format!("path:{}", root.display());
-                            self.sidebar_item(ui, th, &name, &key, &root, cwd == root, side, None, space, actions);
-                        }
+                        let est_h = (drives.len().max(1) as f32 * 26.0 + 8.0) * loc_factor;
+                        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), est_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_clip_rect(ui.max_rect());
+                            for (root, label, space) in drives {
+                                let letter = root.display().to_string().trim_end_matches('\\').to_string();
+                                let name = format!("{label} ({letter})");
+                                let key = format!("path:{}", root.display());
+                                self.sidebar_item(ui, th, &name, &key, &root, cwd == root, side, None, space, actions);
+                            }
+                        });
                     }
                 });
 
@@ -3203,7 +3276,7 @@ impl FilesApp {
     /// A section header (small, dim, like Finder's). Click folds the section; Favorites also
     /// gets a + (add the current folder) on hover and a menu to restore the defaults.
     /// Returns whether the section is expanded.
-    fn sidebar_section(&mut self, ui: &mut egui::Ui, th: Theme, title: &'static str, cwd: &Path, actions: &mut Vec<Action>) -> bool {
+    fn sidebar_section(&mut self, ui: &mut egui::Ui, th: Theme, title: &'static str, cwd: &Path, actions: &mut Vec<Action>) -> (bool, f32) {
         let favorites = title == "Favorites";
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
         let collapsed = self.sidebar_collapsed.contains(title);
@@ -3257,7 +3330,8 @@ impl FilesApp {
                 }
             });
         }
-        !collapsed
+        let anim = ui.ctx().animate_bool_with_time(ui.id().with(title), !collapsed, 0.20);
+        (!collapsed, anim)
     }
 
     /// While a favorite is dragged: an insertion line where it would land and a floating label
@@ -3433,13 +3507,19 @@ impl FilesApp {
         preview::body(ui, &th, &self.preview, "preview");
     }
     fn draw_center(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>, commit_rename: &mut bool) {
-        if self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons) {
-            let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(10, 8));
-            egui::SidePanel::right("files_preview").resizable(true).default_width(300.0).width_range(200.0..=600.0).frame(frame).show(ctx, |ui| {
-
-
-                self.draw_preview(ui, th);
-            });
+        let want_preview = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
+        let prev_factor = ctx.animate_bool_with_time(egui::Id::new("files_preview_slide"), want_preview, 0.20);
+        if prev_factor > 0.005 {
+            let width = (300.0 * prev_factor).max(1.0);
+            let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric((10.0 * prev_factor) as i8, 8));
+            egui::SidePanel::right("files_preview")
+                .resizable(prev_factor >= 0.99)
+                .exact_width(width)
+                .frame(frame)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(ui.max_rect());
+                    self.draw_preview(ui, th);
+                });
         }
         let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(6, 4));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -3756,12 +3836,17 @@ impl FilesApp {
         let target = pointer.and_then(|p| {
             self.zones.iter().rev().find(|z| {
                 z.rect.contains(p)
-                    && !drag.paths.iter().any(|s| s == &z.dir || z.dir.starts_with(s) && s.is_dir())
+                    && !drag.paths.iter().any(|s| {
+                        s == &z.dir
+                            || (z.dir.starts_with(s) && s.is_dir())
+                            || s.parent().map_or(false, |parent| parent == z.dir)
+                    })
             })
         });
         let kind = target.map(|z| default_drop_kind(&drag.paths, &z.dir, mods));
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dnd")));
         if let Some(z) = target {
+            painter.rect_filled(z.rect, CornerRadius::same(th.radius.min(6)), th.accent.gamma_multiply(0.20));
             painter.rect_stroke(z.rect.expand(1.0), CornerRadius::same(th.radius.min(6)), Stroke::new(2.0_f32, th.accent), egui::StrokeKind::Outside);
         }
         if let Some(p) = pointer {
@@ -3896,6 +3981,7 @@ impl FilesApp {
 }
 
 /// Finder's view switcher: one rounded group with the current view raised. Returns a new pick.
+#[allow(dead_code)]
 fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<ViewMode> {
     let mut picked = None;
     let (icon_fn, title): (fn(&egui::Painter, Rect, Color32), &str) = match current {
@@ -4276,3 +4362,4 @@ impl FilesApp {
         }
     }
 }
+
