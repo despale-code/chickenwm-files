@@ -228,7 +228,7 @@ impl Theme {
         v.faint_bg_color = self.pane;
         v.override_text_color = Some(self.fg);
         v.selection.bg_fill = self.accent.gamma_multiply(0.45);
-        v.selection.stroke = Stroke::new(1.0_f32, self.accent);
+        v.selection.stroke = Stroke::NONE;
         v.hyperlink_color = self.accent;
         v.window_stroke = Stroke::new(1.0_f32, self.hairline());
         v.window_corner_radius = CornerRadius::same(self.radius);
@@ -465,6 +465,8 @@ pub struct FilesApp {
     rename: Option<Rename>,
     address: Option<String>,
     focus_search: bool,
+    search_popup_open: bool,
+    search_popup_text: String,
     drag: Option<Drag>,
     marquee: Option<Marquee>,
     compress_prompt: Option<CompressPrompt>,
@@ -667,6 +669,8 @@ impl FilesApp {
             rename: None,
             address: None,
             focus_search: false,
+            search_popup_open: false,
+            search_popup_text: String::new(),
             drag: None,
             marquee: None,
             compress_prompt: None,
@@ -1152,7 +1156,11 @@ impl FilesApp {
             Action::EditAddress => {
                 self.address = Some(self.pane(self.focused()).cwd.display().to_string());
             }
-            Action::FocusSearch => self.focus_search = true,
+            Action::FocusSearch => {
+                self.search_popup_open = true;
+                self.focus_search = true;
+                self.search_popup_text = self.pane(self.focused()).filter.clone();
+            }
             Action::BatchRename(paths) if paths.len() > 1 => self.tools.batch = Some(tools::BatchRename::new(paths)),
             Action::BatchRename(paths) => {
                 if let Some(p) = paths.into_iter().next() {
@@ -1654,6 +1662,7 @@ fn paint_nav_up(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.add(egui::Shape::line(pts.to_vec(), stroke));
 }
 
+#[allow(dead_code)]
 fn paint_nav_refresh(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.6_f32, color);
@@ -2027,13 +2036,12 @@ impl Draw<'_> {
     fn row_background(&self, ui: &egui::Ui, rect: Rect, resp: &egui::Response, selected: bool, cursor: bool) {
         let radius = CornerRadius::same(self.theme.radius.min(6));
         if selected {
-            ui.painter().rect_filled(rect, radius, self.theme.selected);
-            ui.painter().rect_stroke(rect.shrink(0.5), radius, Stroke::new(1.0_f32, self.theme.accent.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+            let fill = if cursor && self.focused { self.theme.selected.gamma_multiply(1.22) } else { self.theme.selected };
+            ui.painter().rect_filled(rect, radius, fill);
+        } else if cursor && self.focused {
+            ui.painter().rect_filled(rect, radius, self.theme.fg.gamma_multiply(0.08));
         } else if resp.hovered() && !self.dragging {
             ui.painter().rect_filled(rect, radius, self.theme.fg.gamma_multiply(0.05));
-        }
-        if cursor && self.focused && !selected {
-            ui.painter().rect_stroke(rect.shrink(0.5), radius, Stroke::new(1.0_f32, self.theme.accent.gamma_multiply(0.45)), egui::StrokeKind::Inside);
         }
     }
 
@@ -2521,10 +2529,11 @@ impl eframe::App for FilesApp {
         self.fav_drop_hover = false;
         let mut commit_rename = false;
         self.draw_sidebar(ctx, theme, &mut actions);
-        self.draw_status(ctx, theme);
+        self.draw_status(ctx, theme, &mut actions);
         self.draw_navbar(ctx, theme, &mut actions);
         self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
         self.draw_tools(ctx, theme);
+        self.draw_search_popup(ctx, theme);
         self.compress_dialog(ctx, theme);
         self.export_folder_dialog(ctx, theme);
         self.export_here_dialog(ctx, theme);
@@ -2558,26 +2567,12 @@ impl FilesApp {
             ui.horizontal(|ui| {
                 let side = self.focused();
 
-
-                // Refresh button (borderless)
-                let (ref_rect, ref_resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
-                if ref_resp.hovered() {
-                    ui.painter().rect_filled(ref_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
-                }
-                let ref_col = if ref_resp.hovered() { th.fg } else { th.dim };
-                paint_nav_refresh(ui.painter(), ref_rect, ref_col);
-                if ref_resp.on_hover_text("Refresh (F5)").clicked() {
-                    actions.push(Action::Refresh);
-                }
-
-                ui.add_space(4.0);
-
-                // Breadcrumbs / Address bar: stretches to meet the right toolbar exactly
-                let right_needed = 400.0;
-                let addr_w = (ui.available_width() - right_needed).max(120.0);
+                // Breadcrumbs / Address bar: stretches cleanly across top
+                let right_needed = 220.0;
+                let addr_w = (ui.available_width() - right_needed).max(140.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
-                // 3. Right-anchored toolbar section (Close button on top right, Tools, Views dropdown, Search)
+                // Right-anchored section (Window Controls & Tasks/Processes)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
 
@@ -2707,12 +2702,12 @@ impl FilesApp {
 
                                                     ui.vertical(|ui| {
                                                         ui.horizontal(|ui| {
-                                                            ui.label(egui::RichText::new(&p.title).strong().size(th.font - 1.0));
-                                                            if let Some(dur) = p.finished.map(|f| f.duration_since(p.started)) {
-                                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                                    ui.label(egui::RichText::new(format!("{:.1}s", dur.as_secs_f32())).small().color(th.dim));
-                                                                });
-                                                            }
+                                                             ui.label(egui::RichText::new(&p.title).strong().size(th.font - 1.0));
+                                                             if let Some(dur) = p.finished.map(|f| f.duration_since(p.started)) {
+                                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                     ui.label(egui::RichText::new(format!("{:.1}s", dur.as_secs_f32())).small().color(th.dim));
+                                                                 });
+                                                             }
                                                         });
                                                         if !p.detail.is_empty() {
                                                             ui.label(egui::RichText::new(&p.detail).small().color(th.dim));
@@ -2737,176 +2732,7 @@ impl FilesApp {
                         }
                     }
 
-                    // Quick Tools: Options Gear, Preview (monotone vector icons, 28px height, borderless)
-                    let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
-
-                    let tools_frame = egui::Frame::NONE
-                        .fill(th.pane)
-                        .corner_radius(CornerRadius::same(th.radius.min(6)))
-                        .stroke(Stroke::NONE)
-                        .inner_margin(egui::Margin::symmetric(2, 2));
-
-                    tools_frame.show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-
-                        // Options Gear
-                        let menu_resp = ui.menu_button(egui::RichText::new("  ").size(th.font), |ui| {
-                            // View Mode list inside settings menu
-                            ui.label(egui::RichText::new("View mode").small().color(th.dim));
-                            for (m, label) in [
-                                (ViewMode::Details, "List / Details"),
-                                (ViewMode::Icons, "Icons"),
-                                (ViewMode::Columns, "Columns"),
-                                (ViewMode::Dual, "Dual pane"),
-                            ] {
-                                if ui.radio(self.prefs.view == m, label).clicked() {
-                                    actions.push(Action::SetView(m));
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.separator();
-
-                            let mut hidden = self.prefs.show_hidden;
-                            if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
-                                actions.push(Action::ToggleHidden);
-                                ui.close_menu();
-                            }
-                            let mut preview = self.prefs.show_preview;
-                            if ui.checkbox(&mut preview, "Preview pane").clicked() {
-                                actions.push(Action::TogglePreview);
-                                ui.close_menu();
-                            }
-                            let mut ext = self.prefs.show_extensions;
-                            if ui.checkbox(&mut ext, "File name extensions").clicked() {
-                                self.prefs.show_extensions = ext;
-                                self.prefs.save();
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            ui.label(egui::RichText::new("Appearance").small().color(th.dim));
-                            use chickenwm_core::theme::AppMode;
-                            for (m, label) in [(AppMode::System, "Follow system"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")] {
-                                if ui.radio(self.app_mode == m, label).clicked() {
-                                    self.app_mode = m;
-                                    if let Err(e) = chickenwm_core::theme::set_app_mode("files", m) {
-                                        self.toast(format!("Couldn't change appearance: {e}"), true);
-                                    }
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.separator();
-                            if ui.button("Dual pane  (F3 / Ctrl+D)").clicked() {
-                                actions.push(Action::ToggleDualPane);
-                                ui.close_menu();
-                            }
-                            if ui.button("Embedded terminal  (Ctrl+`)").clicked() {
-                                actions.push(Action::ToggleTerminal);
-                                ui.close_menu();
-                            }
-                            if ui.button("Undo  (Ctrl+Z)").clicked() {
-                                actions.push(Action::Undo);
-                                ui.close_menu();
-                            }
-                            if ui.button("Go anywhere…  (Ctrl+P)").clicked() {
-                                actions.push(Action::GoAnywhere);
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button("New folder  (Ctrl+Shift+N)").clicked() {
-                                actions.push(Action::NewFolder(self.pane(side).cwd.clone()));
-                                ui.close_menu();
-                            }
-                            if ui.button("Open in External Terminal").clicked() {
-                                actions.push(Action::Terminal(self.pane(side).cwd.clone()));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+L Address").small().color(th.dim));
-                        });
-                        let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
-                        paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
-
-                        // Preview button
-                        let (prev_r, prev_resp) = ui.allocate_exact_size(egui::vec2(22.0, 24.0), Sense::click());
-                        if preview_active {
-                            ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.accent.gamma_multiply(0.18));
-                        } else if prev_resp.hovered() {
-                            ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
-                        }
-                        paint_preview_icon(ui.painter(), prev_r, if preview_active { th.accent } else { th.dim }, preview_active, th.accent);
-                        if prev_resp.on_hover_text("Toggle Preview pane").clicked() {
-                            actions.push(Action::TogglePreview);
-                        }
-                    });
-
-                    // Search Box (monotone vector search & clear icons, unified 28px height)
-                    let (filter_text, folder_title) = {
-                        let pane = self.pane(side);
-                        (pane.filter.clone(), pane.title())
-                    };
-                    let hint = if folder_title.is_empty() { "Search…".to_string() } else { format!("Search {folder_title}…") };
-                    let mut filter_buf = filter_text;
-
-                    let (resp, clear_clicked) = {
-                        let search_frame = egui::Frame::NONE
-                            .fill(th.pane)
-                            .corner_radius(CornerRadius::same(th.radius.min(6)))
-                            .stroke(Stroke::NONE)
-                            .inner_margin(egui::Margin::symmetric(4, 2));
-
-                        search_frame.show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-
-                            // In right-to-left: first item added appears on the right!
-                            let clear_btn = if !filter_buf.is_empty() {
-                                let (clr_r, clr_resp) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::click());
-                                let color = if clr_resp.hovered() { th.fg } else { th.dim };
-                                paint_clear_icon(ui.painter(), clr_r, color);
-                                clr_resp.on_hover_text("Clear search").clicked()
-                            } else {
-                                false
-                            };
-
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut filter_buf)
-                                    .hint_text(hint)
-                                    .desired_width(170.0)
-                                    .frame(false)
-                                    .font(FontId::proportional(th.font - 1.5))
-                                    .margin(egui::Margin::symmetric(2, 2)),
-                            );
-
-                            let (ic_r, _) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::hover());
-                            paint_search_icon(ui.painter(), ic_r, th.dim);
-
-                            (resp, clear_btn)
-                        }).inner
-                    };
-                    if self.focus_search {
-                        resp.request_focus();
-                        self.focus_search = false;
-                    }
-                    if resp.changed() {
-                        let prefs = self.prefs.clone();
-                        let pane = self.pane_mut(side);
-                        pane.filter = filter_buf.clone();
-                        pane.rebuild(&prefs);
-                    }
-                    if clear_clicked {
-                        let prefs = self.prefs.clone();
-                        let pane = self.pane_mut(side);
-                        pane.filter.clear();
-                        pane.rebuild(&prefs);
-                    }
-                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        let prefs = self.prefs.clone();
-                        let pane = self.pane_mut(side);
-                        pane.filter.clear();
-                        pane.rebuild(&prefs);
-                        resp.surrender_focus();
-                    }
-
-                    // Window drag on empty space between search bar and address bar
+                    // Window drag on empty space between address bar and controls
                     let empty_rect = ui.available_rect_before_wrap();
                     if empty_rect.width() > 10.0 {
                         let drag_resp = ui.interact(empty_rect, ui.id().with("win_drag_nav"), Sense::drag());
@@ -3026,12 +2852,17 @@ impl FilesApp {
         }
     }
 
-    fn draw_status(&mut self, ctx: &egui::Context, th: Theme) {
+    fn draw_status(&mut self, ctx: &egui::Context, th: Theme, actions: &mut Vec<Action>) {
         let frame = egui::Frame::NONE
             .fill(th.pane)
-            .stroke(Stroke::new(1.0_f32, th.hairline()))
             .inner_margin(egui::Margin::symmetric(12, 5));
-        egui::TopBottomPanel::bottom("files_status").frame(frame).show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("files_status")
+            .show_separator_line(false)
+            .frame(frame)
+            .show(ctx, |ui| {
+                // Top border only
+                let top_y = ui.max_rect().top();
+                ui.painter().hline(ui.max_rect().x_range(), top_y, Stroke::new(1.0_f32, th.hairline()));
 
             ui.horizontal(|ui| {
                 let pane = self.pane(self.focused());
@@ -3087,6 +2918,22 @@ impl FilesApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 1. Rightmost: Toggle right sidebar button (Preview pane)
+                    let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
+                    let (prev_r, prev_resp) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), Sense::click());
+                    if preview_active {
+                        ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.accent.gamma_multiply(0.18));
+                    } else if prev_resp.hovered() {
+                        ui.painter().rect_filled(prev_r, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                    }
+                    paint_preview_icon(ui.painter(), prev_r, if preview_active { th.accent } else { th.dim }, preview_active, th.accent);
+                    if prev_resp.on_hover_text("Toggle right sidebar / Preview pane").clicked() {
+                        actions.push(Action::TogglePreview);
+                    }
+
+                    ui.add_space(8.0);
+
+                    // 2. Disk space view
                     if let Some((free, total)) = shell::disk_space(&pane_root(&self.pane(self.focused()).cwd)) {
                         ui.label(
                             egui::RichText::new(format!("{} free / {}", format_bytes(free), format_bytes(total)))
@@ -3095,16 +2942,19 @@ impl FilesApp {
                         );
                     }
 
+                    // 3. Git status with vector branch icon (no undefined box ascii)
                     let branch = self.tools.git.branch.lock().clone();
                     let summary = self.tools.git.summary.lock().clone();
                     if let Some(b) = branch {
                         ui.separator();
                         let git_text = if let Some(s) = summary {
-                            format!(" {b}  ({s})")
+                            format!("{b}  ({s})")
                         } else {
-                            format!(" {b}")
+                            b
                         };
                         ui.label(egui::RichText::new(git_text).size(th.font - 1.5).color(th.accent));
+                        let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                        chickenwm_core::ui_icons::paint_git_branch(ui.painter(), icon_r, th.accent);
                     }
                 });
             });
@@ -3271,8 +3121,92 @@ impl FilesApp {
                     }
                 });
 
-
+                // Bottom bar inside left sidebar: Settings gear button on bottom right
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let menu_resp = ui.menu_button(egui::RichText::new("  ").size(th.font), |ui| {
+                            self.settings_menu(ui, th, side, actions);
+                        });
+                        let gear_color = if menu_resp.response.hovered() { th.fg } else { th.dim };
+                        paint_gear_icon(ui.painter(), menu_resp.response.rect, gear_color);
+                    });
+                });
             });
+    }
+
+    /// Settings menu popup containing view modes, display options, and quick commands.
+    fn settings_menu(&mut self, ui: &mut egui::Ui, th: Theme, side: Side, actions: &mut Vec<Action>) {
+        ui.label(egui::RichText::new("View mode").small().color(th.dim));
+        for (m, label) in [
+            (ViewMode::Details, "List / Details"),
+            (ViewMode::Icons, "Icons"),
+            (ViewMode::Columns, "Columns"),
+            (ViewMode::Dual, "Dual pane"),
+        ] {
+            if ui.radio(self.prefs.view == m, label).clicked() {
+                actions.push(Action::SetView(m));
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+
+        let mut hidden = self.prefs.show_hidden;
+        if ui.checkbox(&mut hidden, "Show hidden items  (Ctrl+H)").clicked() {
+            actions.push(Action::ToggleHidden);
+            ui.close_menu();
+        }
+        let mut preview = self.prefs.show_preview;
+        if ui.checkbox(&mut preview, "Preview pane").clicked() {
+            actions.push(Action::TogglePreview);
+            ui.close_menu();
+        }
+        let mut ext = self.prefs.show_extensions;
+        if ui.checkbox(&mut ext, "File name extensions").clicked() {
+            self.prefs.show_extensions = ext;
+            self.prefs.save();
+            ui.close_menu();
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Appearance").small().color(th.dim));
+        use chickenwm_core::theme::AppMode;
+        for (m, label) in [(AppMode::System, "Follow system"), (AppMode::Light, "Light"), (AppMode::Dark, "Dark")] {
+            if ui.radio(self.app_mode == m, label).clicked() {
+                self.app_mode = m;
+                if let Err(e) = chickenwm_core::theme::set_app_mode("files", m) {
+                    self.toast(format!("Couldn't change appearance: {e}"), true);
+                }
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+        if ui.button("Dual pane  (F3 / Ctrl+D)").clicked() {
+            actions.push(Action::ToggleDualPane);
+            ui.close_menu();
+        }
+        if ui.button("Embedded terminal  (Ctrl+`)").clicked() {
+            actions.push(Action::ToggleTerminal);
+            ui.close_menu();
+        }
+        if ui.button("Undo  (Ctrl+Z)").clicked() {
+            actions.push(Action::Undo);
+            ui.close_menu();
+        }
+        if ui.button("Go anywhere…  (Ctrl+P)").clicked() {
+            actions.push(Action::GoAnywhere);
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.button("New folder  (Ctrl+Shift+N)").clicked() {
+            actions.push(Action::NewFolder(self.pane(side).cwd.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Open in External Terminal").clicked() {
+            actions.push(Action::Terminal(self.pane(side).cwd.clone()));
+            ui.close_menu();
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+L Address · / Search").small().color(th.dim));
     }
 
     /// A section header (small, dim, like Finder's). Click folds the section; Favorites also
@@ -4365,3 +4299,105 @@ impl FilesApp {
     }
 }
 
+
+impl FilesApp {
+    fn draw_search_popup(&mut self, ctx: &egui::Context, th: Theme) {
+        if !self.search_popup_open {
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+        let side = self.focused();
+        let (matches_count, total_count) = {
+            let pane = self.pane(side);
+            (pane.visible.len(), pane.entries.len())
+        };
+
+        // Floating popup on bottom of the screen, just above the bottom status infobar
+        let popup_w = 360.0_f32.min(screen.width() - 40.0);
+        let popup_h = 36.0_f32;
+        let pos = Pos2::new(
+            screen.center().x - popup_w / 2.0,
+            screen.bottom() - 32.0 - popup_h - 10.0,
+        );
+
+        let area = egui::Area::new(egui::Id::new("bottom_search_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos);
+
+        let mut close_and_clear = false;
+
+        area.show(ctx, |ui| {
+            let frame = egui::Frame::NONE
+                .fill(th.pane)
+                .stroke(Stroke::new(1.0_f32, th.accent.gamma_multiply(0.4)))
+                .corner_radius(CornerRadius::same(th.radius.min(8)))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 6],
+                    blur: 20,
+                    spread: 0,
+                    color: Color32::from_black_alpha(140),
+                })
+                .inner_margin(egui::Margin::symmetric(10, 5));
+
+            frame.show(ui, |ui| {
+                ui.set_width(popup_w);
+                ui.horizontal(|ui| {
+                    let (ic_r, _) = ui.allocate_exact_size(egui::vec2(16.0, 24.0), Sense::hover());
+                    paint_search_icon(ui.painter(), ic_r, th.accent);
+
+                    let edit_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_popup_text)
+                            .hint_text("Search folder…")
+                            .desired_width(popup_w - 145.0)
+                            .frame(false)
+                            .font(FontId::proportional(th.font)),
+                    );
+
+                    if self.focus_search {
+                        edit_resp.request_focus();
+                        self.focus_search = false;
+                    }
+
+                    if edit_resp.changed() {
+                        let filter_text = self.search_popup_text.clone();
+                        let prefs = self.prefs.clone();
+                        let pane = self.pane_mut(side);
+                        pane.filter = filter_text;
+                        pane.rebuild(&prefs);
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close_and_clear = true;
+                    }
+
+                    let count_text = if self.search_popup_text.is_empty() {
+                        format!("{} items", total_count)
+                    } else {
+                        format!("{}/{} matches", matches_count, total_count)
+                    };
+                    ui.label(egui::RichText::new(count_text).size(th.font - 2.0).color(th.dim));
+
+                    let (x_rect, x_resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::click());
+                    if x_resp.hovered() {
+                        ui.painter().rect_filled(x_rect, CornerRadius::same(4), th.fg.gamma_multiply(0.08));
+                    }
+                    let x_col = if x_resp.hovered() { th.fg } else { th.dim };
+                    paint_clear_icon(ui.painter(), x_rect, x_col);
+                    if x_resp.on_hover_text("Close and clear filter (Esc)").clicked() {
+                        close_and_clear = true;
+                    }
+                });
+            });
+        });
+
+        if close_and_clear {
+            self.search_popup_open = false;
+            self.search_popup_text.clear();
+            let prefs = self.prefs.clone();
+            let pane = self.pane_mut(side);
+            pane.filter.clear();
+            pane.rebuild(&prefs);
+        }
+    }
+}
