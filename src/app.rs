@@ -136,6 +136,9 @@ fn rgb(r: u8, g: u8, b: u8) -> RgbaColor {
 }
 
 impl Theme {
+    pub fn hairline(&self) -> Color32 {
+        self.border.gamma_multiply(0.65)
+    }
     fn from_css(sheet: &CssStyleSheet) -> Self {
         let fg = c(sheet.var_color("--fg-color", rgb(205, 214, 244)));
         let accent = c(sheet.var_color("--accent-color", rgb(51, 204, 255)));
@@ -154,7 +157,16 @@ impl Theme {
                 "--selected-bg",
                 RgbaColor { r: 51, g: 204, b: 255, a: 56 },
             )),
-            border: c(sheet.var_color("--border-color", rgb(49, 50, 68))),
+            border: {
+                let mut b = c(sheet.var_color(
+                    "--border-color",
+                    RgbaColor { r: 255, g: 255, b: 255, a: 22 },
+                ));
+                if b.a() == 255 {
+                    b = b.gamma_multiply(0.4);
+                }
+                b
+            },
             radius: sheet.var_px("--border-radius", 8.0).clamp(0.0, 16.0) as u8,
             row_h: sheet.var_px("--row-height", 28.0).clamp(20.0, 48.0),
             font: sheet.var_px("--font-size", 14.0).clamp(10.0, 22.0),
@@ -189,7 +201,7 @@ impl Theme {
         v.selection.bg_fill = self.accent.gamma_multiply(0.45);
         v.selection.stroke = Stroke::new(1.0_f32, self.accent);
         v.hyperlink_color = self.accent;
-        v.window_stroke = Stroke::new(1.0_f32, self.border);
+        v.window_stroke = Stroke::new(1.0_f32, self.hairline());
         v.window_corner_radius = CornerRadius::same(self.radius);
         v.menu_corner_radius = CornerRadius::same(self.radius.min(8));
         for w in [
@@ -204,7 +216,7 @@ impl Theme {
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, self.border);
         v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
         v.widgets.inactive.bg_fill = self.pane;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.border);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, self.hairline());
         v.widgets.hovered.weak_bg_fill = self.accent.gamma_multiply(0.15);
         v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, self.accent.gamma_multiply(0.5));
         v.widgets.active.weak_bg_fill = self.accent.gamma_multiply(0.3);
@@ -1737,7 +1749,7 @@ impl Draw<'_> {
         col(ui, "Date modified", SortKey::Modified, date_w, self.actions);
         col(ui, "Type", SortKey::Type, type_w, self.actions);
         col(ui, "Size", SortKey::Size, size_w, self.actions);
-        ui.painter().hline(header.x_range(), header.bottom(), Stroke::new(1.0_f32, th.border));
+        ui.painter().hline(header.x_range(), header.bottom(), Stroke::new(1.0_f32, th.hairline()));
 
         let list_rect = ui.available_rect_before_wrap();
         self.background(ui, side, pane, list_rect);
@@ -2054,7 +2066,7 @@ impl FilesApp {
                 let nav_frame = egui::Frame::NONE
                     .fill(th.pane)
                     .corner_radius(CornerRadius::same(th.radius.min(6)))
-                    .stroke(Stroke::new(1.0_f32, th.border))
+                    .stroke(Stroke::new(1.0_f32, th.hairline()))
                     .inner_margin(egui::Margin::symmetric(4, 2));
 
                 nav_frame.show(ui, |ui| {
@@ -2148,7 +2160,7 @@ impl FilesApp {
                         egui::RichText::new("◨").size(th.font + 1.0).color(if preview_active { th.accent } else { th.dim })
                     )
                     .fill(if preview_active { th.accent.gamma_multiply(0.18) } else { th.pane })
-                    .stroke(Stroke::new(1.0_f32, if preview_active { th.accent.gamma_multiply(0.5) } else { th.border }))
+                    .stroke(Stroke::new(1.0_f32, if preview_active { th.accent.gamma_multiply(0.5) } else { th.hairline() }))
                     .min_size(egui::vec2(28.0, 26.0)),
                 ).on_hover_text("Toggle Preview pane");
                 if prev_btn.clicked() {
@@ -2161,7 +2173,7 @@ impl FilesApp {
                         egui::RichText::new("").size(th.font).color(if term_active { th.accent } else { th.dim })
                     )
                     .fill(if term_active { th.accent.gamma_multiply(0.18) } else { th.pane })
-                    .stroke(Stroke::new(1.0_f32, if term_active { th.accent.gamma_multiply(0.5) } else { th.border }))
+                    .stroke(Stroke::new(1.0_f32, if term_active { th.accent.gamma_multiply(0.5) } else { th.hairline() }))
                     .min_size(egui::vec2(28.0, 26.0)),
                 ).on_hover_text("Toggle Embedded Quick Terminal (Ctrl+`)");
                 if term_btn.clicked() {
@@ -2227,7 +2239,7 @@ impl FilesApp {
                     ui.label(egui::RichText::new("Shortcuts: F3 Dual · Ctrl+` Terminal · Ctrl+T Tab · Ctrl+W Close · Ctrl+L Address").small().color(th.dim));
                 });
             });
-            ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().bottom(), Stroke::new(1.0_f32, th.border));
+
         });
     }
 
@@ -2256,7 +2268,7 @@ impl FilesApp {
         }
         let cwd = self.pane(side).cwd.clone();
         let (rect, bg_resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
-        ui.painter().rect(rect, CornerRadius::same(th.radius.min(8)), th.pane, Stroke::new(1.0_f32, th.border), egui::StrokeKind::Inside);
+        ui.painter().rect(rect, CornerRadius::same(th.radius.min(8)), th.pane, Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
         if bg_resp.clicked() {
             actions.push(Action::EditAddress);
         }
@@ -2308,7 +2320,7 @@ impl FilesApp {
             .fill(th.sidebar)
             .inner_margin(egui::Margin::symmetric(12, 5));
         egui::TopBottomPanel::bottom("files_status").frame(frame).show(ctx, |ui| {
-            ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top(), Stroke::new(1.0_f32, th.border));
+
             ui.horizontal(|ui| {
                 let pane = self.pane(self.focused());
                 let mut text = format!("{} items", pane.visible.len());
@@ -2395,7 +2407,7 @@ impl FilesApp {
             .resizable(true)
             .default_width(210.0)
             .width_range(160.0..=340.0)
-            .show_separator_line(false)
+            .show_separator_line(true)
             .frame(frame)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2433,8 +2445,8 @@ impl FilesApp {
                         }
                     }
                 });
-                let rect = ui.max_rect();
-                ui.painter().vline(rect.right(), rect.y_range(), Stroke::new(1.0_f32, th.border));
+
+
             });
     }
 
@@ -2680,8 +2692,8 @@ impl FilesApp {
         if self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons) {
             let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(10, 8));
             egui::SidePanel::right("files_preview").resizable(true).default_width(300.0).width_range(200.0..=600.0).frame(frame).show(ctx, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().vline(rect.left(), rect.y_range(), Stroke::new(1.0_f32, th.border));
+
+
                 self.draw_preview(ui, th);
             });
         }
@@ -2942,7 +2954,7 @@ fn view_segments(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
     let (group, _) = ui.allocate_exact_size(egui::vec2(widths.iter().sum::<f32>() + 4.0, 26.0), Sense::hover());
     let radius = CornerRadius::same(th.radius.clamp(4, 6));
     ui.painter().rect_filled(group, radius, th.pane);
-    ui.painter().rect_stroke(group, radius, Stroke::new(1.0_f32, th.border), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(group, radius, Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
     let mut x = group.left() + 2.0;
     let mut picked = None;
     for ((view, label, tip), w) in VIEWS.iter().zip(widths) {

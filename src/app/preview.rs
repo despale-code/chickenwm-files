@@ -295,7 +295,7 @@ pub(super) fn body(ui: &mut egui::Ui, th: &Theme, preview: &Preview, salt: &str)
     let rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), rect.height().max(80.0)));
     ui.allocate_rect(rect, Sense::hover());
     let radius = CornerRadius::same(th.radius.clamp(6, 14));
-    ui.painter().rect(rect, radius, th.bg, Stroke::new(1.0_f32, th.border), egui::StrokeKind::Inside);
+    ui.painter().rect(rect, radius, th.bg.gamma_multiply(0.35), Stroke::new(1.0_f32, th.hairline()), egui::StrokeKind::Inside);
     let inner = rect.shrink(12.0);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Center)));
     let ui = &mut child;
