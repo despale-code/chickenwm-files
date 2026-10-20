@@ -35,6 +35,14 @@ enum Side {
     Second,
 }
 
+#[derive(Clone)]
+struct Marquee {
+    side: Side,
+    start: Pos2,
+    current: Pos2,
+    initial_selection: std::collections::HashSet<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropKind {
     Copy,
@@ -305,7 +313,7 @@ pub struct FilesApp {
     address: Option<String>,
     focus_search: bool,
     drag: Option<Drag>,
-    marquee: Option<(Side, Pos2, Pos2)>,
+    marquee: Option<Marquee>,
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
     jobs: Arc<Jobs>,
@@ -1399,7 +1407,7 @@ struct Draw<'a> {
     dragging: bool,
     focused: bool,
     actions: &'a mut Vec<Action>,
-    marquee: &'a mut Option<(Side, Pos2, Pos2)>,
+    marquee: &'a mut Option<Marquee>,
     /// Folder sizes and git badges for this frame.
     extras: &'a tools::RowExtras,
 }
@@ -1832,23 +1840,30 @@ impl Draw<'_> {
         let resp = ui.interact(rect, ui.id().with(("bg", side)), Sense::click_and_drag());
         if resp.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pos) = resp.interact_pointer_pos() {
-                *self.marquee = Some((side, pos, pos));
+                let initial_selection = if ui.input(|i| i.modifiers.ctrl) {
+                    pane.selection.clone()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                *self.marquee = Some(Marquee {
+                    side,
+                    start: pos,
+                    current: pos,
+                    initial_selection,
+                });
                 if !ui.input(|i| i.modifiers.ctrl) {
                     self.actions.push(Action::ClearSelection(side));
                 }
             }
         }
         if resp.dragged_by(egui::PointerButton::Primary) {
-            if let Some((m_side, _, current)) = self.marquee.as_mut() {
-                if *m_side == side {
+            if let Some(m) = self.marquee.as_mut() {
+                if m.side == side {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                        *current = pos;
+                        m.current = pos;
                     }
                 }
             }
-        }
-        if resp.drag_stopped() || ui.input(|i| i.pointer.any_released()) {
-            *self.marquee = None;
         }
         if resp.clicked() || resp.secondary_clicked() {
             self.actions.push(Action::ClearSelection(side));
@@ -1914,9 +1929,9 @@ impl Draw<'_> {
         self.empty_message(ui, list_rect, pane);
 
         let mut marquee_hits = Vec::new();
-        let marquee_box = if let Some((m_side, start, current)) = *self.marquee {
-            if m_side == side {
-                let r = Rect::from_two_pos(start, current);
+        let marquee_box = if let Some(m) = self.marquee.as_ref() {
+            if m.side == side {
+                let r = Rect::from_two_pos(m.start, m.current);
                 if r.width() > 3.0 || r.height() > 3.0 { Some(r) } else { None }
             } else {
                 None
@@ -1985,20 +2000,22 @@ impl Draw<'_> {
                 self.interact(&resp, side, pos, entry, pane, rect, dual);
             }
         });
-        if let Some(mbox) = marquee_box {
-            ui.painter().rect_filled(mbox, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
-            ui.painter().rect_stroke(mbox, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
-            if !marquee_hits.is_empty() {
-                let mut new_sel = if ui.input(|i| i.modifiers.ctrl) {
-                    pane.selection.clone()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                for p in marquee_hits {
-                    new_sel.insert(p);
+        if let Some(m) = self.marquee.as_ref() {
+            if m.side == side {
+                let r = Rect::from_two_pos(m.start, m.current);
+                if r.width() > 3.0 || r.height() > 3.0 {
+                    ui.painter().rect_filled(r, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
+                    ui.painter().rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+                    let mut new_sel = m.initial_selection.clone();
+                    for p in marquee_hits {
+                        new_sel.insert(p);
+                    }
+                    self.actions.push(Action::SetSelection(side, new_sel));
                 }
-                self.actions.push(Action::SetSelection(side, new_sel));
             }
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            *self.marquee = None;
         }
 
         ScrollMemo { offset: out.state.offset.y, viewport: out.inner_rect.height() }
@@ -2023,20 +2040,30 @@ impl Draw<'_> {
             self.actions.push(Action::SetIconScale(scale - 0.1));
         }
 
-        let tile = egui::vec2((114.0 * scale).round(), (104.0 * scale).round());
         let list_rect = ui.available_rect_before_wrap();
         self.background(ui, side, pane, list_rect);
         self.empty_message(ui, list_rect, pane);
-        let gap = 4.0;
-        let cols = ((list_rect.width() - 8.0) / (tile.x + gap)).floor().max(1.0) as usize;
+
+        // AUTOFIT: distribute width evenly across all columns so there is no gap on the right!
+        let available_w = (list_rect.width() - 16.0).max(60.0);
+        let base_w = (112.0 * scale).round();
+        let base_h = (104.0 * scale).round();
+        let min_gap = 6.0_f32;
+
+        let cols = ((available_w + min_gap) / (base_w + min_gap)).floor().max(1.0) as usize;
         *cols_out = cols;
+
+        let total_gaps = (cols.saturating_sub(1)) as f32 * min_gap;
+        let tile_w = ((available_w - total_gaps) / cols as f32).floor();
+        let tile = egui::vec2(tile_w, base_h);
+        let gap = min_gap;
         let rows = pane.visible.len().div_ceil(cols);
         let sa = self.scroll_area(side, "icons", pane, tile.y + gap, cols, memo);
 
         let mut marquee_hits = Vec::new();
-        let marquee_box = if let Some((m_side, start, current)) = *self.marquee {
-            if m_side == side {
-                let r = Rect::from_two_pos(start, current);
+        let marquee_box = if let Some(m) = self.marquee.as_ref() {
+            if m.side == side {
+                let r = Rect::from_two_pos(m.start, m.current);
                 if r.width() > 3.0 || r.height() > 3.0 { Some(r) } else { None }
             } else {
                 None
@@ -2048,7 +2075,8 @@ impl Draw<'_> {
         let out = sa.show_rows(ui, tile.y + gap, rows, |ui, range| {
             for row in range {
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
+                    ui.spacing_mut().item_spacing.x = min_gap;
+                    ui.add_space(8.0);
                     for pos in row * cols..((row + 1) * cols).min(pane.visible.len()) {
                         let Some(entry) = pane.entry_at(pos) else { continue };
                         let (rect, resp) = ui.allocate_exact_size(tile, Sense::click_and_drag());
@@ -2064,7 +2092,7 @@ impl Draw<'_> {
                         let icon_size = (42.0 * scale).round();
                         let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (26.0 * scale).round()), Vec2::splat(icon_size));
                         paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
-                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 2.0, rect.top() + (52.0 * scale).round()), Pos2::new(rect.right() - 2.0, rect.bottom() - 1.0));
+                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (52.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 1.0));
                         if !self.rename_field(ui, entry, Rect::from_min_size(label_rect.min, egui::vec2(label_rect.width(), 24.0))) {
                             let galley = ui.painter().layout(
                                 shown_name(entry, self.prefs),
@@ -2082,20 +2110,22 @@ impl Draw<'_> {
             }
         });
 
-        if let Some(mbox) = marquee_box {
-            ui.painter().rect_filled(mbox, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
-            ui.painter().rect_stroke(mbox, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
-            if !marquee_hits.is_empty() {
-                let mut new_sel = if ui.input(|i| i.modifiers.ctrl) {
-                    pane.selection.clone()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                for p in marquee_hits {
-                    new_sel.insert(p);
+        if let Some(m) = self.marquee.as_ref() {
+            if m.side == side {
+                let r = Rect::from_two_pos(m.start, m.current);
+                if r.width() > 3.0 || r.height() > 3.0 {
+                    ui.painter().rect_filled(r, CornerRadius::ZERO, th.accent.gamma_multiply(0.18));
+                    ui.painter().rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+                    let mut new_sel = m.initial_selection.clone();
+                    for p in marquee_hits {
+                        new_sel.insert(p);
+                    }
+                    self.actions.push(Action::SetSelection(side, new_sel));
                 }
-                self.actions.push(Action::SetSelection(side, new_sel));
             }
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            *self.marquee = None;
         }
 
         ScrollMemo { offset: out.state.offset.y, viewport: out.inner_rect.height() }
@@ -2349,8 +2379,8 @@ impl FilesApp {
 
                 ui.add_space(4.0);
 
-                // 2. Breadcrumbs / Address bar: stretches to fill all available width
-                let right_needed = 320.0;
+                // 2. Breadcrumbs / Address bar: stretches to meet the right toolbar exactly
+                let right_needed = 380.0;
                 let addr_w = (ui.available_width() - right_needed).max(120.0);
                 self.address_bar(ui, side, addr_w, th, actions);
 
@@ -2494,7 +2524,7 @@ impl FilesApp {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut filter_buf)
                                     .hint_text(hint)
-                                    .desired_width(120.0)
+                                    .desired_width(170.0)
                                     .frame(false)
                                     .font(FontId::proportional(th.font - 1.5))
                                     .margin(egui::Margin::symmetric(2, 2)),
@@ -3250,7 +3280,7 @@ fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
     frame.show(ui, |ui| {
         let label = format!("     {title}   ");
         let menu_resp = ui.menu_button(egui::RichText::new(label).size(th.font - 1.0).color(th.fg), |ui| {
-            ui.set_min_width(125.0);
+            ui.set_min_width(190.0);
             let items = [
                 (ViewMode::Details, "List", "Ctrl+Shift+1", paint_view_list as fn(&egui::Painter, Rect, Color32)),
                 (ViewMode::Icons, "Icons", "Ctrl+Shift+2", paint_view_icons),
@@ -3259,14 +3289,14 @@ fn view_dropdown(ui: &mut egui::Ui, th: Theme, current: ViewMode) -> Option<View
             ];
             for (vm, name, sc, p_icon) in items {
                 let active = vm == current;
-                let (r, resp) = ui.allocate_exact_size(egui::vec2(125.0, 24.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(190.0, 24.0), Sense::click());
                 if resp.hovered() || active {
                     ui.painter().rect_filled(r, CornerRadius::same(4), if active { th.accent.gamma_multiply(0.18) } else { th.fg.gamma_multiply(0.06) });
                 }
-                let ic_r = Rect::from_min_size(r.min + egui::vec2(6.0, 4.0), egui::vec2(16.0, 16.0));
+                let ic_r = Rect::from_min_size(r.min + egui::vec2(8.0, 4.0), egui::vec2(16.0, 16.0));
                 p_icon(ui.painter(), ic_r, if active { th.accent } else { th.fg });
-                ui.painter().text(r.min + egui::vec2(28.0, 12.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 1.0), if active { th.accent } else { th.fg });
-                ui.painter().text(r.max - egui::vec2(6.0, 12.0), Align2::RIGHT_CENTER, sc, FontId::proportional(th.font - 3.0), th.dim);
+                ui.painter().text(r.min + egui::vec2(30.0, 12.0), Align2::LEFT_CENTER, name, FontId::proportional(th.font - 0.5), if active { th.accent } else { th.fg });
+                ui.painter().text(r.max - egui::vec2(10.0, 12.0), Align2::RIGHT_CENTER, sc, FontId::proportional(th.font - 2.5), th.dim);
                 if resp.clicked() {
                     picked = Some(vm);
                     ui.close_menu();
