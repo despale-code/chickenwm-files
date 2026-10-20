@@ -1810,11 +1810,6 @@ impl Draw<'_> {
         let radius = CornerRadius::same(self.theme.radius.min(6));
         if selected {
             ui.painter().rect_filled(rect, radius, self.theme.selected);
-            let indicator = Rect::from_min_size(
-                Pos2::new(rect.left() + 2.0, rect.top() + 3.0),
-                Vec2::new(3.0, (rect.height() - 6.0).max(4.0)),
-            );
-            ui.painter().rect_filled(indicator, CornerRadius::same(2), self.theme.accent);
             ui.painter().rect_stroke(rect.shrink(0.5), radius, Stroke::new(1.0_f32, self.theme.accent.gamma_multiply(0.4)), egui::StrokeKind::Inside);
         } else if resp.hovered() && !self.dragging {
             ui.painter().rect_filled(rect, radius, self.theme.fg.gamma_multiply(0.05));
@@ -2962,11 +2957,6 @@ impl FilesApp {
         let dragging_this = favorite.is_some() && self.fav_drag == favorite;
         if active {
             ui.painter().rect_filled(rect, radius, th.selected);
-            let indicator = Rect::from_min_size(
-                Pos2::new(rect.left() + 2.0, rect.top() + 4.0),
-                Vec2::new(3.0, (rect.height() - 8.0).max(4.0)),
-            );
-            ui.painter().rect_filled(indicator, CornerRadius::same(2), th.accent);
         } else if resp.hovered() && self.fav_drag.is_none() {
             ui.painter().rect_filled(rect, radius, th.fg.gamma_multiply(0.06));
         }
