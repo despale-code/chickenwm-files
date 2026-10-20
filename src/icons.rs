@@ -96,18 +96,16 @@ fn theme_request(key: &str) -> Option<IconRequest> {
     Some(IconRequest::App(stem))
 }
 
-fn load_theme_png(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>)> {
-    let img = image::open(path).ok()?;
+fn load_theme_image(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>)> {
     // Rendered at 16 / 40 logical px; keep 2x for high-DPI.
     let side = if large { 80 } else { 32 };
-    let img = img.resize(side, side, image::imageops::FilterType::Lanczos3).to_rgba8();
-    Some((img.width() as usize, img.height() as usize, img.into_raw()))
+    chickenwm_core::icon_theme::load_icon_image(path, side)
 }
 
 fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
     let themed = theme_request(key)
         .and_then(|req| theme.resolve(&req))
-        .and_then(|png| load_theme_png(&png, large));
+        .and_then(|p| load_theme_image(&p, large));
     let mut decoded = shell_lookup(key, large, themed.is_some());
     decoded.theme = theme.name.clone();
     if themed.is_some() {
