@@ -22,7 +22,7 @@ use notify::{RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -139,7 +139,7 @@ enum Action {
 
 /// Colors and metrics from `files.css`.
 #[derive(Clone, Copy, PartialEq)]
-struct Theme {
+pub(super) struct Theme {
     bg: Color32,
     pane: Color32,
     sidebar: Color32,
@@ -275,6 +275,115 @@ struct Rename {
     just_started: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProcessStatus {
+    Running,
+    Completed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessItem {
+    pub id: u64,
+    pub title: String,
+    pub detail: String,
+    pub progress: Option<f32>,
+    pub status: ProcessStatus,
+    pub started: Instant,
+    pub finished: Option<Instant>,
+}
+
+pub struct ProcessManager {
+    next_id: AtomicU64,
+    items: Mutex<Vec<ProcessItem>>,
+}
+
+impl ProcessManager {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            items: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn add(&self, title: String, detail: String) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut list = self.items.lock();
+        list.insert(0, ProcessItem {
+            id,
+            title,
+            detail,
+            progress: None,
+            status: ProcessStatus::Running,
+            started: Instant::now(),
+            finished: None,
+        });
+        if list.len() > 25 {
+            list.truncate(25);
+        }
+        id
+    }
+
+    pub fn update_progress(&self, id: u64, progress: Option<f32>) {
+        let mut list = self.items.lock();
+        if let Some(item) = list.iter_mut().find(|it| it.id == id) {
+            item.progress = progress;
+        }
+    }
+
+    pub fn finish(&self, id: u64, result: Result<String, String>) {
+        let mut list = self.items.lock();
+        if let Some(item) = list.iter_mut().find(|it| it.id == id) {
+            item.finished = Some(Instant::now());
+            item.progress = Some(1.0);
+            match result {
+                Ok(_) => item.status = ProcessStatus::Completed,
+                Err(err) => item.status = ProcessStatus::Failed(err),
+            }
+        }
+    }
+
+    pub fn clear_finished(&self) {
+        let mut list = self.items.lock();
+        list.retain(|it| it.status == ProcessStatus::Running);
+    }
+
+    pub fn active(&self) -> Vec<ProcessItem> {
+        self.items.lock().iter().filter(|it| it.status == ProcessStatus::Running).cloned().collect()
+    }
+
+    pub fn all(&self) -> Vec<ProcessItem> {
+        self.items.lock().clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchiveDrag {
+    pub archive: PathBuf,
+    pub member: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+    pub origin_rect: Rect,
+    pub grab_offset: Vec2,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportFolderPrompt {
+    pub archive: PathBuf,
+    pub dest_dir: PathBuf,
+    pub folder_name: String,
+    pub initial_focus: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportHerePrompt {
+    pub archive: PathBuf,
+    pub dest_dir: PathBuf,
+    pub folder_name: String,
+    pub initial_focus: bool,
+}
+
 struct Drag {
     paths: Vec<PathBuf>,
     secondary: bool,
@@ -359,12 +468,18 @@ pub struct FilesApp {
     drag: Option<Drag>,
     marquee: Option<Marquee>,
     compress_prompt: Option<CompressPrompt>,
+    export_folder_prompt: Option<ExportFolderPrompt>,
+    export_here_prompt: Option<ExportHerePrompt>,
     pending_focus: Option<(Side, PathBuf)>,
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
     fav_drop_hover: bool,
     snap_back: Option<SnapBackAnim>,
+    archive_drag: Option<ArchiveDrag>,
+    archive_snap_back: Option<SnapBackAnim>,
     jobs: Arc<Jobs>,
+    processes: Arc<ProcessManager>,
+    show_processes: bool,
     dirty: Arc<AtomicBool>,
     last_reload: Instant,
     watcher: Option<notify::RecommendedWatcher>,
@@ -548,16 +663,22 @@ impl FilesApp {
             drag: None,
             marquee: None,
             compress_prompt: None,
+            export_folder_prompt: None,
+            export_here_prompt: None,
             pending_focus: None,
             zones: Vec::new(),
             drop_menu: None,
             fav_drop_hover: false,
             snap_back: None,
+            archive_drag: None,
+            archive_snap_back: None,
             jobs: Arc::new(Jobs {
                 running: AtomicUsize::new(0),
                 status: Mutex::new(String::new()),
                 progress: Mutex::new(None),
             }),
+            processes: Arc::new(ProcessManager::new()),
+            show_processes: false,
             dirty,
             last_reload: Instant::now(),
             watcher,
@@ -586,6 +707,13 @@ impl FilesApp {
             terminal: terminal::EmbeddedTerminal::new(initial_dir.clone()),
         };
         app.refresh_drives();
+        if tools::is_browsable_archive(&display_name(&initial_dir)) {
+            app.tools.archive = Some(tools::ArchiveView::open(initial_dir.clone()));
+        } else if let Some(sel) = initial_select.as_ref() {
+            if tools::is_browsable_archive(&display_name(sel)) {
+                app.tools.archive = Some(tools::ArchiveView::open(sel.clone()));
+            }
+        }
         app
     }
 
@@ -666,15 +794,18 @@ impl FilesApp {
         self.watched = want;
     }
 
-    /// Runs `work` on a worker thread; the visible folders refresh when it finishes.
+    /// Runs `work` on a worker thread; visible folders refresh and updates ProcessManager.
     fn spawn_job(
         &self,
         label: String,
+        detail: String,
         work: impl FnOnce(&dyn Fn(f32)) -> Result<String, String> + Send + 'static,
     ) {
         let jobs = self.jobs.clone();
+        let procs = self.processes.clone();
         let dirty = self.dirty.clone();
         let ctx = self.ctx.clone();
+        let id = procs.add(label.clone(), detail);
         jobs.running.fetch_add(1, Ordering::SeqCst);
         *jobs.status.lock() = label;
         *jobs.progress.lock() = None;
@@ -682,14 +813,16 @@ impl FilesApp {
             shell::init_com_thread();
             let report = |p: f32| {
                 *jobs.progress.lock() = Some(p);
+                procs.update_progress(id, Some(p));
                 ctx.request_repaint();
             };
             let result = work(&report);
-            *jobs.status.lock() = match result {
-                Ok(msg) => msg,
+            *jobs.status.lock() = match &result {
+                Ok(msg) => msg.clone(),
                 Err(msg) => format!("⚠ {msg}"),
             };
             *jobs.progress.lock() = None;
+            procs.finish(id, result);
             jobs.running.fetch_sub(1, Ordering::SeqCst);
             dirty.store(true, Ordering::Relaxed);
             ctx.request_repaint();
@@ -705,8 +838,9 @@ impl FilesApp {
             FileOp::Delete => ("Deleting", "Deleted"),
         };
         let what = if n == 1 { display_name(&sources[0]) } else { format!("{n} items") };
-        let label = format!("{verb} {what}…");
-        self.spawn_job(label, move |_| {
+        let label = format!("{verb} {what}");
+        let detail = dest.as_ref().map(|d| format!("To {}", d.display())).unwrap_or_default();
+        self.spawn_job(label, detail, move |_| {
             if shell::file_op(op, &sources, dest.as_deref()) {
                 if clear_clipboard {
                     shell::clipboard_clear();
@@ -815,7 +949,8 @@ impl FilesApp {
                 let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
                 let name = display_name(&archive);
                 let dest = if into_folder { unique_path(&parent, archive_stem(&name), "") } else { parent };
-                self.spawn_job(format!("Extracting {name}…"), move |progress| {
+                let detail = format!("To {}", dest.display());
+                self.spawn_job(format!("Extracting {name}"), detail, move |progress| {
                     extract_archive(&archive, &dest, progress)
                         .map(|_| format!("Extracted {name}"))
                         .map_err(|e| format!("Extract failed: {e}"))
@@ -844,7 +979,8 @@ impl FilesApp {
                 let target_path = zip_path.clone();
                 let side = self.focused();
                 self.pending_focus = Some((side, target_path));
-                self.spawn_job(format!("Compressing to {name}…"), move |progress| {
+                let detail = format!("{} items", paths.len());
+                self.spawn_job(format!("Compressing to {name}"), detail, move |progress| {
                     let res = compress_zip(&paths, &zip_path, progress)
                         .map(|_| format!("Created {name}"))
                         .map_err(|e| format!("Compress failed: {e}"));
@@ -1489,7 +1625,7 @@ struct Draw<'a> {
 
 // ==================== MONOTONE VECTOR UI ICONS ====================
 
-fn paint_nav_back(painter: &egui::Painter, rect: Rect, color: Color32) {
+pub(super) fn paint_nav_back(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.8_f32, color);
     let pts = [c + egui::vec2(2.5, -5.0), c + egui::vec2(-2.5, 0.0), c + egui::vec2(2.5, 5.0)];
@@ -1603,6 +1739,29 @@ fn paint_terminal_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     painter.line_segment([c + egui::vec2(1.0, 3.5), c + egui::vec2(5.5, 3.5)], stroke);
 }
 
+fn paint_process_icon(painter: &egui::Painter, rect: Rect, color: Color32, running: bool) {
+    let c = rect.center();
+    let r = 5.2_f32;
+    let stroke = Stroke::new(1.4_f32, color);
+    painter.circle_stroke(c, r, stroke);
+    if running {
+        painter.circle_filled(c, 2.0, color);
+    } else {
+        let pts = [c + egui::vec2(-2.5, 0.0), c + egui::vec2(-0.5, 2.2), c + egui::vec2(2.8, -2.0)];
+        painter.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.3_f32, color)));
+    }
+}
+
+pub(super) fn paint_archive_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let c = rect.center();
+    let stroke = Stroke::new(1.3_f32, color);
+    let box_rect = Rect::from_center_size(c, egui::vec2(13.0, 11.0));
+    painter.rect_stroke(box_rect, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    painter.line_segment([Pos2::new(box_rect.left(), c.y), Pos2::new(box_rect.right(), c.y)], Stroke::new(1.0_f32, color.gamma_multiply(0.6)));
+    let buckle = Rect::from_center_size(c, egui::vec2(3.5, 4.5));
+    painter.rect_filled(buckle, CornerRadius::same(1), color);
+}
+
 fn paint_gear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     let c = rect.center();
     let stroke = Stroke::new(1.5_f32, color);
@@ -1616,7 +1775,7 @@ fn paint_gear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
-fn paint_icon_painter(painter: &egui::Painter, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
+pub(super) fn paint_icon_painter(painter: &egui::Painter, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
     if let Some(tex) = icons.get(key, large) {
         painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
     } else if fallback_dir {
@@ -2354,6 +2513,8 @@ impl eframe::App for FilesApp {
         self.draw_center(ctx, theme, &mut actions, &mut commit_rename);
         self.draw_tools(ctx, theme);
         self.compress_dialog(ctx, theme);
+        self.export_folder_dialog(ctx, theme);
+        self.export_here_dialog(ctx, theme);
         self.handle_drag_and_drop(ctx, theme, &mut actions);
 
         for a in actions {
@@ -2468,6 +2629,122 @@ impl FilesApp {
                     }
 
                     ui.add_space(4.0);
+
+                    // Top Processes Pill & Dropdown
+                    let active_procs = self.processes.active();
+                    let all_procs = self.processes.all();
+                    let running = !active_procs.is_empty();
+                    let has_history = !all_procs.is_empty();
+
+                    if running || has_history {
+                        let proc_label = if let Some(first) = active_procs.first() {
+                            if let Some(p) = first.progress {
+                                format!("{} ({}%)", first.title, (p * 100.0) as u32)
+                            } else {
+                                first.title.clone()
+                            }
+                        } else {
+                            format!("Tasks ({})", all_procs.len())
+                        };
+
+                        let btn_text = egui::RichText::new(&proc_label).size(th.font - 1.5).color(if running { th.fg } else { th.dim });
+                        let proc_btn = egui::Button::new(btn_text)
+                            .fill(if running { th.accent.gamma_multiply(0.15) } else { th.pane })
+                            .stroke(Stroke::new(1.0_f32, if running { th.accent } else { th.hairline() }))
+                            .corner_radius(CornerRadius::same(th.radius.min(6)))
+                            .min_size(egui::vec2(0.0, 26.0));
+
+                        let proc_resp = ui.add(proc_btn).on_hover_text("Background file operations, extraction & compression");
+                        if proc_resp.clicked() {
+                            self.show_processes = !self.show_processes;
+                        }
+
+                        if self.show_processes {
+                            let dropdown_pos = Pos2::new(proc_resp.rect.left().min(ui.available_rect_before_wrap().right() - 320.0), proc_resp.rect.bottom() + 4.0);
+                            let area = egui::Area::new(egui::Id::new("processes_dropdown"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(dropdown_pos);
+
+                            area.show(ctx, |ui| {
+                                let frame = egui::Frame::NONE
+                                    .fill(th.pane)
+                                    .stroke(Stroke::new(1.0_f32, th.accent.gamma_multiply(0.5)))
+                                    .corner_radius(CornerRadius::same(th.radius.max(8)))
+                                    .shadow(egui::epaint::Shadow {
+                                        offset: [0, 8],
+                                        blur: 24,
+                                        spread: 0,
+                                        color: Color32::from_black_alpha(150),
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(12, 10));
+
+                                frame.show(ui, |ui| {
+                                    ui.set_width(310.0);
+                                    ui.horizontal(|ui| {
+                                        let (pr_icon, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                                        paint_process_icon(ui.painter(), pr_icon, th.accent, running);
+                                        ui.label(egui::RichText::new("Processes").strong().size(th.font));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if ui.add(egui::Button::new("Clear").min_size(Vec2::new(0.0, 20.0))).clicked() {
+                                                self.processes.clear_finished();
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(4.0);
+                                    ui.separator();
+                                    ui.add_space(2.0);
+
+                                    let procs = self.processes.all();
+                                    if procs.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(10.0);
+                                            ui.label(egui::RichText::new("No active or recent processes").color(th.dim));
+                                            ui.add_space(10.0);
+                                        });
+                                    } else {
+                                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                            for p in &procs {
+                                                ui.horizontal(|ui| {
+                                                    let is_run = p.status == ProcessStatus::Running;
+                                                    let status_color = match &p.status {
+                                                        ProcessStatus::Running => th.accent,
+                                                        ProcessStatus::Completed => Color32::from_rgb(166, 227, 161),
+                                                        ProcessStatus::Failed(_) => Color32::from_rgb(243, 139, 168),
+                                                    };
+                                                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                                    ui.painter().circle_filled(dot.center(), 3.5, status_color);
+
+                                                    ui.vertical(|ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new(&p.title).strong().size(th.font - 1.0));
+                                                            if let Some(dur) = p.finished.map(|f| f.duration_since(p.started)) {
+                                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                    ui.label(egui::RichText::new(format!("{:.1}s", dur.as_secs_f32())).small().color(th.dim));
+                                                                });
+                                                            }
+                                                        });
+                                                        if !p.detail.is_empty() {
+                                                            ui.label(egui::RichText::new(&p.detail).small().color(th.dim));
+                                                        }
+                                                        if is_run {
+                                                            if let Some(pct) = p.progress {
+                                                                ui.add(egui::ProgressBar::new(pct).desired_width(260.0));
+                                                            } else {
+                                                                ui.spinner();
+                                                            }
+                                                        } else if let ProcessStatus::Failed(err) = &p.status {
+                                                            ui.label(egui::RichText::new(err).small().color(Color32::from_rgb(243, 139, 168)));
+                                                        }
+                                                    });
+                                                });
+                                                ui.separator();
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                        }
+                    }
 
                     // Quick Tools: Options Gear, Terminal, Preview (monotone vector icons, 28px height)
                     let preview_active = self.prefs.show_preview && matches!(self.prefs.view, ViewMode::Details | ViewMode::Icons);
@@ -3166,6 +3443,10 @@ impl FilesApp {
         }
         let frame = egui::Frame::NONE.fill(th.pane).inner_margin(egui::Margin::symmetric(6, 4));
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            if self.tools.archive.is_some() {
+                self.draw_archive_screen(ui, th, actions);
+                return;
+            }
             let view = self.prefs.view;
             let dragging = self.drag.is_some();
             // Split borrows: panes are read, everything else is drawn through `Draw`.
@@ -3356,6 +3637,109 @@ impl FilesApp {
             let clicked_outside = ctx.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && menu.opened.elapsed() > Duration::from_millis(150);
             if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.drop_menu = None;
+            }
+        }
+
+        // Handle dragging individual items OUT of the zip / archive screen
+        if let Some(adrag) = &self.archive_drag {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dnd")));
+            let target = self.zones.iter().find(|z| pointer.is_some_and(|p| z.rect.contains(p)));
+            if let Some(p) = pointer {
+                let tile_pos = p - adrag.grab_offset;
+                let tile_rect = Rect::from_min_size(tile_pos, adrag.origin_rect.size());
+
+                painter.rect_filled(tile_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(75));
+                painter.rect_filled(tile_rect, CornerRadius::same(th.radius.min(8)), th.pane);
+                painter.rect_stroke(tile_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.5_f32, th.accent), egui::StrokeKind::Inside);
+
+                let icon_rect = Rect::from_center_size(Pos2::new(tile_rect.left() + 20.0, tile_rect.center().y), Vec2::splat(16.0));
+                if adrag.is_dir {
+                    chickenwm_core::ui_icons::paint_folder(&painter, icon_rect, th.dir);
+                } else {
+                    let ext = adrag.name.rsplit('.').next().unwrap_or("");
+                    let key = format!("ext:{ext}");
+                    paint_icon_painter(&painter, &mut self.icons, &key, false, icon_rect, false, &th);
+                }
+
+                painter.text(
+                    tile_rect.left_center() + egui::vec2(38.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    &adrag.name,
+                    FontId::proportional(th.font),
+                    if adrag.is_dir { th.dir } else { th.fg },
+                );
+
+                let size_str = adrag.size.map(|s| format!(" ({})", format_bytes(s))).unwrap_or_default();
+                let hint = if let Some(z) = target {
+                    format!("➡ Extract {}{size_str} to {}", adrag.name, display_name(&z.dir))
+                } else {
+                    format!("Extract {}{size_str} (drop onto Favorites or a folder)", adrag.name)
+                };
+                let h_galley = painter.layout_no_wrap(hint, FontId::proportional(th.font - 1.5), th.fg);
+                let h_rect = Rect::from_min_size(p + egui::vec2(16.0, 16.0), h_galley.size() + egui::vec2(16.0, 8.0));
+                painter.rect(h_rect, CornerRadius::same(6), th.pane, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+                painter.galley(h_rect.min + egui::vec2(8.0, 4.0), h_galley, th.fg);
+            }
+
+            if released || !any_down {
+                let drag = self.archive_drag.take().unwrap();
+                if let Some(z) = target {
+                    let archive_path = drag.archive.clone();
+                    let member = drag.member.clone();
+                    let is_dir = drag.is_dir;
+                    let name = drag.name.clone();
+                    let dest = z.dir.clone();
+                    self.spawn_job(format!("Extracting {name}"), format!("To {}", dest.display()), move |_| {
+                        tools::extract_archive_member(&archive_path, &member, is_dir, &dest)
+                            .map(|p| format!("Extracted {}", display_name(&p)))
+                            .map_err(|e| format!("Extract failed: {e}"))
+                    });
+                    self.toast(format!("Extracting {} to {}", name, display_name(&z.dir)), false);
+                } else {
+                    let start_pos = pointer.map(|p| p - drag.grab_offset).unwrap_or(drag.origin_rect.min);
+                    let start_rect = Rect::from_min_size(start_pos, drag.origin_rect.size());
+                    self.archive_snap_back = Some(SnapBackAnim {
+                        path: PathBuf::from(&drag.member),
+                        icon_key: format!("ext:{}", drag.name.rsplit('.').next().unwrap_or("")),
+                        is_dir: drag.is_dir,
+                        name: drag.name,
+                        start_rect,
+                        target_rect: drag.origin_rect,
+                        start_time: Instant::now(),
+                        duration: Duration::from_millis(180),
+                    });
+                    ctx.request_repaint();
+                }
+            }
+            return;
+        }
+
+        // Archive snap-back animation
+        if let Some(anim) = &self.archive_snap_back {
+            let t = (anim.start_time.elapsed().as_secs_f32() / anim.duration.as_secs_f32()).clamp(0.0, 1.0);
+            if t < 1.0 {
+                let ease = 1.0 - (1.0 - t).powi(3);
+                let cur_min = anim.start_rect.min.lerp(anim.target_rect.min, ease);
+                let cur_rect = Rect::from_min_size(cur_min, anim.target_rect.size());
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("archive_snapback")));
+
+                let alpha = (60.0 * (1.0 - ease)) as u8;
+                painter.rect_filled(cur_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(alpha));
+                painter.rect_filled(cur_rect, CornerRadius::same(th.radius.min(8)), th.pane);
+                painter.rect_stroke(cur_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.2_f32, th.accent.gamma_multiply(1.0 - ease)), egui::StrokeKind::Inside);
+
+                let icon_rect = Rect::from_center_size(Pos2::new(cur_rect.left() + 20.0, cur_rect.center().y), Vec2::splat(16.0));
+                if anim.is_dir {
+                    chickenwm_core::ui_icons::paint_folder(&painter, icon_rect, th.dir);
+                } else {
+                    paint_icon_painter(&painter, &mut self.icons, &anim.icon_key, false, icon_rect, false, &th);
+                }
+
+                painter.text(cur_rect.left_center() + egui::vec2(38.0, 0.0), Align2::LEFT_CENTER, &anim.name, FontId::proportional(th.font), th.fg);
+                ctx.request_repaint();
+            } else {
+                self.archive_snap_back = None;
+                ctx.request_repaint();
             }
         }
 
@@ -3568,6 +3952,225 @@ fn pane_root(path: &Path) -> PathBuf {
 }
 
 impl FilesApp {
+    fn export_folder_dialog(&mut self, ctx: &egui::Context, th: Theme) {
+        let Some(prompt) = self.export_folder_prompt.as_mut() else { return };
+        let mut cancel = false;
+        let mut commit = false;
+
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(th.pane)
+            .corner_radius(CornerRadius::same(th.radius.max(8)))
+            .stroke(Stroke::new(1.0_f32, th.accent))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 10],
+                blur: 28,
+                spread: 0,
+                color: Color32::from_black_alpha(170),
+            })
+            .inner_margin(egui::Margin::same(16));
+
+        egui::Window::new("Export to Folder")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    chickenwm_core::ui_icons::paint_folder(ui.painter(), icon_r, th.accent);
+                    ui.add_space(4.0);
+                    ui.heading("Export Archive to Folder");
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("Extract all contents of {} into a new folder:", display_name(&prompt.archive))).color(th.dim));
+                ui.add_space(12.0);
+
+                ui.label(egui::RichText::new("Folder name:").strong().size(th.font));
+                ui.add_space(4.0);
+
+                let id = egui::Id::new("export_folder_name_input");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.folder_name)
+                        .id(id)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .font(FontId::proportional(th.font)),
+                );
+
+                if prompt.initial_focus {
+                    prompt.initial_focus = false;
+                    resp.request_focus();
+                    let len = prompt.folder_name.chars().count();
+                    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(len),
+                        )));
+                        state.store(ctx, id);
+                    }
+                }
+
+                if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn_h = 28.0;
+                        if ui.add(egui::Button::new(egui::RichText::new("Export").strong().color(Color32::WHITE))
+                            .fill(th.accent)
+                            .min_size(egui::vec2(85.0, btn_h))).clicked()
+                        {
+                            commit = true;
+                        }
+                        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(75.0, btn_h))).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.export_folder_prompt = None;
+        } else if commit {
+            if let Some(prompt) = self.export_folder_prompt.take() {
+                let name = prompt.folder_name.trim().to_string();
+                let stem = if name.is_empty() { "archive" } else { &name };
+                let target_dir = unique_path(&prompt.dest_dir, stem, "");
+                let archive_path = prompt.archive.clone();
+                let arc_name = display_name(&archive_path);
+                let dest = target_dir.clone();
+                self.spawn_job(format!("Extracting {arc_name}"), format!("To {}", dest.display()), move |progress| {
+                    extract_archive(&archive_path, &dest, progress)
+                        .map(|_| format!("Extracted {arc_name}"))
+                        .map_err(|e| format!("Extract failed: {e}"))
+                });
+                self.toast(format!("Exporting to {}", display_name(&target_dir)), false);
+            }
+        }
+    }
+
+    fn export_here_dialog(&mut self, ctx: &egui::Context, th: Theme) {
+        let Some(prompt) = self.export_here_prompt.as_mut() else { return };
+        let mut cancel = false;
+        let mut extract_subfolder = false;
+        let mut extract_here_anyway = false;
+
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(th.pane)
+            .corner_radius(CornerRadius::same(th.radius.max(8)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(249, 226, 175)))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 10],
+                blur: 28,
+                spread: 0,
+                color: Color32::from_black_alpha(170),
+            })
+            .inner_margin(egui::Margin::same(16));
+
+        egui::Window::new("Folder Contains Other Items")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠️").size(18.0));
+                    ui.add_space(4.0);
+                    ui.heading("Folder Contains Existing Files");
+                });
+                ui.add_space(6.0);
+                let dest_name = display_name(&prompt.dest_dir);
+                ui.label(egui::RichText::new(format!(
+                    "The folder '{dest_name}' already contains other files or directories. Extracting everything here directly might clutter this folder."
+                )).color(th.dim));
+                ui.add_space(12.0);
+
+                ui.label(egui::RichText::new("Extract into a new subfolder instead:").strong().size(th.font));
+                ui.add_space(4.0);
+
+                let id = egui::Id::new("export_here_folder_name_input");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.folder_name)
+                        .id(id)
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(8, 6))
+                        .font(FontId::proportional(th.font)),
+                );
+
+                if prompt.initial_focus {
+                    prompt.initial_focus = false;
+                    resp.request_focus();
+                }
+
+                if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    extract_subfolder = true;
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    let btn_h = 28.0;
+                    if ui.add(egui::Button::new(egui::RichText::new("Create Folder & Extract").strong().color(Color32::WHITE))
+                        .fill(th.accent)
+                        .min_size(egui::vec2(160.0, btn_h))).clicked()
+                    {
+                        extract_subfolder = true;
+                    }
+                    if ui.add(egui::Button::new("Extract here anyway").min_size(egui::vec2(120.0, btn_h))).clicked() {
+                        extract_here_anyway = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(egui::Button::new("Cancel").min_size(egui::vec2(60.0, btn_h))).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+
+        if cancel {
+            self.export_here_prompt = None;
+        } else if extract_subfolder {
+            if let Some(prompt) = self.export_here_prompt.take() {
+                let name = prompt.folder_name.trim().to_string();
+                let stem = if name.is_empty() { "archive" } else { &name };
+                let target_dir = unique_path(&prompt.dest_dir, stem, "");
+                let archive_path = prompt.archive.clone();
+                let arc_name = display_name(&archive_path);
+                let dest = target_dir.clone();
+                self.spawn_job(format!("Extracting {arc_name}"), format!("To {}", dest.display()), move |progress| {
+                    extract_archive(&archive_path, &dest, progress)
+                        .map(|_| format!("Extracted {arc_name}"))
+                        .map_err(|e| format!("Extract failed: {e}"))
+                });
+                self.toast(format!("Exporting to {}", display_name(&target_dir)), false);
+            }
+        } else if extract_here_anyway {
+            if let Some(prompt) = self.export_here_prompt.take() {
+                let archive_path = prompt.archive.clone();
+                let arc_name = display_name(&archive_path);
+                let dest = prompt.dest_dir.clone();
+                let dest_target = dest.clone();
+                self.spawn_job(format!("Extracting {arc_name}"), format!("To {}", dest.display()), move |progress| {
+                    extract_archive(&archive_path, &dest_target, progress)
+                        .map(|_| format!("Extracted {arc_name}"))
+                        .map_err(|e| format!("Extract failed: {e}"))
+                });
+                self.toast(format!("Extracting to {}", display_name(&dest)), false);
+            }
+        }
+    }
+
     fn compress_dialog(&mut self, ctx: &egui::Context, th: Theme) {
         let Some(prompt) = self.compress_prompt.as_mut() else { return };
         let mut commit = false;

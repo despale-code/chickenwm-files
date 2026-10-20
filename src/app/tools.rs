@@ -7,6 +7,8 @@
 //! - undo (Ctrl+Z) for renames, moves, copies and new files / folders.
 
 use super::{config_dir, display_name, quick_access, Action, FilesApp, Theme};
+use crate::app::{paint_nav_back, paint_archive_icon, paint_icon_painter, ArchiveDrag, ExportFolderPrompt, ExportHerePrompt};
+use crate::model::{archive_stem, extract_archive};
 use crate::model::format_bytes;
 use crate::shell::{self, FileOp};
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Vec2};
@@ -767,21 +769,49 @@ pub(super) fn archive_children(items: &[ArchiveItem], dir: &str) -> Vec<ArchiveI
     out
 }
 
-/// Extracts one member (a file) into `dest`, returning where it landed.
-fn extract_member(archive: &Path, member: &str, dest: &Path) -> anyhow::Result<PathBuf> {
+/// Extracts one member (file or folder) into `dest`, returning where it landed.
+pub(super) fn extract_archive_member(archive: &Path, member: &str, is_dir: bool, dest: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(dest)?;
     let lower = archive.to_string_lossy().to_ascii_lowercase();
-    let out_path = dest.join(member.rsplit('/').next().unwrap_or(member));
+    let base_name = member.rsplit('/').next().unwrap_or(member);
+    let out_path = dest.join(base_name);
+
     if lower.ends_with(".zip") {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
-        let idx = (0..zip.len())
-            .find(|&i| {
-                zip.by_index_raw(i)
-                    .is_ok_and(|f| f.name().is_ok_and(|n| n.replace('\\', "/").trim_end_matches('/') == member))
-            })
-            .ok_or_else(|| anyhow::anyhow!("{member} not found"))?;
-        let mut f = zip.by_index(idx)?;
-        std::io::copy(&mut f, &mut std::fs::File::create(&out_path)?)?;
+        if is_dir {
+            std::fs::create_dir_all(&out_path)?;
+            let prefix = format!("{}/", member.trim_end_matches('/'));
+            for i in 0..zip.len() {
+                let mut f = zip.by_index(i)?;
+                let name = f.name()?.replace('\\', "/");
+                if name.starts_with(&prefix) {
+                    let rel = name.strip_prefix(&prefix).unwrap_or(&name);
+                    if rel.is_empty() {
+                        continue;
+                    }
+                    let target = out_path.join(rel);
+                    if f.is_dir() {
+                        std::fs::create_dir_all(&target)?;
+                    } else {
+                        if let Some(p) = target.parent() {
+                            std::fs::create_dir_all(p)?;
+                        }
+                        std::io::copy(&mut f, &mut std::fs::File::create(&target)?)?;
+                    }
+                }
+            }
+            Ok(out_path)
+        } else {
+            let idx = (0..zip.len())
+                .find(|&i| {
+                    zip.by_index_raw(i)
+                        .is_ok_and(|f| f.name().is_ok_and(|n| n.replace('\\', "/").trim_end_matches('/') == member))
+                })
+                .ok_or_else(|| anyhow::anyhow!("{member} not found"))?;
+            let mut f = zip.by_index(idx)?;
+            std::io::copy(&mut f, &mut std::fs::File::create(&out_path)?)?;
+            Ok(out_path)
+        }
     } else {
         let staging = dest.join(format!(".x-{}", std::process::id()));
         std::fs::create_dir_all(&staging)?;
@@ -789,136 +819,236 @@ fn extract_member(archive: &Path, member: &str, dest: &Path) -> anyhow::Result<P
         if !status.success() {
             anyhow::bail!("tar couldn't extract {member}");
         }
-        std::fs::rename(staging.join(member.replace('/', "\\")), &out_path)?;
+        let member_path = staging.join(member.replace('/', "\\"));
+        if member_path.exists() {
+            if out_path.exists() {
+                let _ = std::fs::remove_dir_all(&out_path);
+                let _ = std::fs::remove_file(&out_path);
+            }
+            std::fs::rename(&member_path, &out_path)?;
+        }
         let _ = std::fs::remove_dir_all(&staging);
+        Ok(out_path)
     }
-    Ok(out_path)
 }
 
+
+
 pub(super) struct ArchiveView {
-    archive: PathBuf,
-    items: Result<Vec<ArchiveItem>, String>,
-    dir: String,
-    selected: Option<String>,
+    pub archive: PathBuf,
+    pub items: Result<Vec<ArchiveItem>, String>,
+    pub dir: String,
+    pub selected: Option<String>,
+    pub filter: String,
 }
 
 impl ArchiveView {
     pub fn open(archive: PathBuf) -> Self {
         let items = list_archive(&archive).map_err(|e| e.to_string());
-        Self { archive, items, dir: String::new(), selected: None }
+        Self { archive, items, dir: String::new(), selected: None, filter: String::new() }
     }
 }
 
 impl FilesApp {
-    fn archive_window(&mut self, ctx: &egui::Context, th: Theme) {
+    /// Renders the Zip / Archive screen as a dedicated first-class screen filling the main area.
+    pub(super) fn draw_archive_screen(&mut self, ui: &mut egui::Ui, th: Theme, _actions: &mut Vec<Action>) {
         let Some(av) = self.tools.archive.as_mut() else { return };
-        let mut open = true;
-        let mut extract_all: Option<bool> = None;
+        let mut exit_archive = false;
         let mut open_member: Option<String> = None;
-        let mut extract_member_here: Option<String> = None;
+        let mut extract_member_to: Option<(String, bool, PathBuf)> = None;
+        let mut trigger_export_folder = false;
+        let mut trigger_export_here = false;
+        let mut start_archive_drag: Option<(String, String, bool, Option<u64>, Rect, Vec2)> = None;
 
-        let frame = egui::Frame::window(&ctx.style())
-            .fill(th.pane)
-            .corner_radius(CornerRadius::same(th.radius.max(8)))
-            .stroke(Stroke::new(1.0_f32, th.border))
-            .shadow(egui::epaint::Shadow {
-                offset: [0, 10],
-                blur: 28,
-                spread: 0,
-                color: Color32::from_black_alpha(160),
-            })
-            .inner_margin(egui::Margin::symmetric(14, 12));
+        // Archive Top Bar
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
 
-        let win_title = format!("Archive — {}", display_name(&av.archive));
-        egui::Window::new(win_title)
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .movable(true)
-            .constrain(true)
-            .default_size([680.0, 500.0])
-            .min_size([460.0, 320.0])
-            .default_pos(Pos2::new(140.0, 80.0))
-            .frame(frame)
-            .show(ctx, |ui| {
+            // Back button
+            let back_tip = if av.dir.is_empty() { "Exit Archive (Esc)" } else { "Up one level" };
+            let (back_rect, back_resp) = ui.allocate_exact_size(Vec2::new(26.0, 26.0), Sense::click());
+            if back_resp.hovered() {
+                ui.painter().rect_filled(back_rect, CornerRadius::same(5), th.fg.gamma_multiply(0.08));
+            }
+            paint_nav_back(ui.painter(), back_rect, if back_resp.hovered() { th.fg } else { th.dim });
+            if back_resp.on_hover_text(back_tip).clicked() {
+                if av.dir.is_empty() {
+                    exit_archive = true;
+                } else {
+                    av.dir = av.dir.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
+                    av.selected = None;
+                }
+            }
+
+            // Archive Chip
+            let chip_frame = egui::Frame::NONE
+                .fill(th.sidebar)
+                .stroke(Stroke::new(1.0_f32, th.hairline()))
+                .corner_radius(CornerRadius::same(th.radius.min(6)))
+                .inner_margin(egui::Margin::symmetric(8, 4));
+            chip_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if ui.add_enabled(!av.dir.is_empty(), egui::Button::new("⬆ Up").min_size(egui::vec2(54.0, 26.0))).clicked() {
-                        av.dir = av.dir.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
-                    }
-                    let path_text = if av.dir.is_empty() {
-                        "/ (Root)".to_string()
-                    } else {
-                        format!("/{}", av.dir)
-                    };
-                    ui.label(egui::RichText::new(path_text).strong().size(th.font));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(egui::Button::new("Extract to folder").min_size(egui::vec2(0.0, 26.0))).clicked() {
-                            extract_all = Some(true);
-                        }
-                        if ui.add(egui::Button::new("Extract here").min_size(egui::vec2(0.0, 26.0))).clicked() {
-                            extract_all = Some(false);
-                        }
-                    });
+                    let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                    paint_archive_icon(ui.painter(), icon_r, th.accent);
+                    ui.label(egui::RichText::new(display_name(&av.archive)).strong().size(th.font));
                 });
+            });
 
-                ui.add_space(4.0);
-                ui.separator();
-
-                match &av.items {
-                    Err(e) => {
-                        ui.colored_label(Color32::from_rgb(220, 90, 80), format!("Can't read this archive: {e}"));
+            // Breadcrumb navigation within the archive
+            ui.separator();
+            if ui.selectable_label(av.dir.is_empty(), "Root").clicked() {
+                av.dir.clear();
+                av.selected = None;
+            }
+            if !av.dir.is_empty() {
+                let mut accum = String::new();
+                for seg in av.dir.split('/') {
+                    if !accum.is_empty() {
+                        accum.push('/');
                     }
-                    Ok(items) => {
-                        let children = archive_children(items, &av.dir);
+                    accum.push_str(seg);
+                    ui.label(egui::RichText::new("›").color(th.dim));
+                    let is_last = accum == av.dir;
+                    let seg_str = accum.clone();
+                    if ui.selectable_label(is_last, seg).clicked() && !is_last {
+                        av.dir = seg_str;
+                        av.selected = None;
+                        break;
+                    }
+                }
+            }
 
-                        ui.horizontal(|ui| {
-                            ui.add_space(34.0);
-                            ui.label(egui::RichText::new("Name").small().color(th.dim));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add_space(14.0);
-                                ui.label(egui::RichText::new("Size").small().color(th.dim));
-                            });
-                        });
-                        ui.separator();
+            // Right-aligned actions: Export to folder, Export here, Exit
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Exit button
+                let close_btn = egui::Button::new(egui::RichText::new("✕ Close").size(th.font - 1.0))
+                    .min_size(Vec2::new(0.0, 26.0))
+                    .corner_radius(CornerRadius::same(th.radius.min(6)));
+                if ui.add(close_btn).on_hover_text("Close Archive (Esc)").clicked() {
+                    exit_archive = true;
+                }
 
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let w = ui.available_width();
-                                for c in &children {
-                                    let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, th.row_h), Sense::click());
+                // Export to folder button
+                let exp_folder_btn = egui::Button::new(egui::RichText::new("📂 Export to folder...").strong().color(Color32::WHITE).size(th.font - 0.5))
+                    .fill(th.accent)
+                    .corner_radius(CornerRadius::same(th.radius.min(6)))
+                    .min_size(Vec2::new(0.0, 26.0));
+                if ui.add(exp_folder_btn).on_hover_text("Extract all files into a named folder").clicked() {
+                    trigger_export_folder = true;
+                }
+
+                // Export here button
+                let exp_here_btn = egui::Button::new(egui::RichText::new("📥 Export here").color(th.fg).size(th.font - 0.5))
+                    .fill(th.sidebar)
+                    .stroke(Stroke::new(1.0_f32, th.hairline()))
+                    .corner_radius(CornerRadius::same(th.radius.min(6)))
+                    .min_size(Vec2::new(0.0, 26.0));
+                if ui.add(exp_here_btn).on_hover_text("Extract archive contents directly into current folder").clicked() {
+                    trigger_export_here = true;
+                }
+
+                // Filter / Search input
+                ui.add(
+                    egui::TextEdit::singleline(&mut av.filter)
+                        .hint_text("Search archive...")
+                        .desired_width(140.0)
+                        .margin(egui::Margin::symmetric(6, 4))
+                        .font(FontId::proportional(th.font - 1.0)),
+                );
+            });
+        });
+
+        ui.add_space(4.0);
+        let divider_y = ui.cursor().top();
+        ui.painter().hline(ui.available_rect_before_wrap().x_range(), divider_y, Stroke::new(1.0_f32, th.hairline()));
+        ui.add_space(6.0);
+
+        // Header columns
+        ui.horizontal(|ui| {
+            ui.add_space(42.0);
+            ui.label(egui::RichText::new("Name").small().color(th.dim));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Size").small().color(th.dim));
+            });
+        });
+        ui.separator();
+
+        match &av.items {
+            Err(e) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.colored_label(Color32::from_rgb(220, 90, 80), format!("Can't read this archive: {e}"));
+                });
+            }
+            Ok(items) => {
+                let mut children = archive_children(items, &av.dir);
+                if !av.filter.is_empty() {
+                    let needle = av.filter.to_ascii_lowercase();
+                    children.retain(|c| c.path.to_ascii_lowercase().contains(&needle));
+                }
+
+                if children.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(egui::RichText::new("This folder in the archive is empty").color(th.dim));
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let w = ui.available_width();
+                            for c in &children {
+                                let name = c.path.rsplit('/').next().unwrap_or(&c.path);
+                                let is_dragged = self.archive_drag.as_ref().is_some_and(|d| d.member == c.path);
+                                let is_snapping = self.archive_snap_back.as_ref().is_some_and(|s| s.path.to_string_lossy() == c.path);
+
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, th.row_h), Sense::click_and_drag());
+                                if is_dragged || is_snapping {
+                                    ui.painter().rect_stroke(rect, CornerRadius::same(th.radius.min(6)), Stroke::new(1.0_f32, th.hairline().gamma_multiply(0.25)), egui::StrokeKind::Inside);
+                                } else {
                                     let selected = av.selected.as_deref() == Some(c.path.as_str());
                                     if selected {
-                                        ui.painter().rect_filled(rect, 4.0, th.selected);
+                                        ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.selected);
+                                        ui.painter().rect_stroke(rect.shrink(0.5), CornerRadius::same(th.radius.min(6)), Stroke::new(1.0_f32, th.accent.gamma_multiply(0.4)), egui::StrokeKind::Inside);
                                     } else if resp.hovered() {
-                                        ui.painter().rect_filled(rect, 4.0, th.accent.gamma_multiply(0.12));
+                                        ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.06));
                                     }
 
-                                    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 16.0, rect.center().y), Vec2::splat(16.0));
+                                    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 20.0, rect.center().y), Vec2::splat(16.0));
                                     if c.is_dir {
                                         chickenwm_core::ui_icons::paint_folder(ui.painter(), icon_rect, th.dir);
                                     } else {
-                                        chickenwm_core::ui_icons::paint_window(ui.painter(), icon_rect, th.dim);
+                                        let ext = name.rsplit('.').next().unwrap_or("");
+                                        let key = format!("ext:{ext}");
+                                        paint_icon_painter(ui.painter(), &mut self.icons, &key, false, icon_rect, false, &th);
                                     }
 
                                     let font = FontId::proportional(th.font);
                                     ui.painter().text(
-                                        rect.left_center() + egui::vec2(32.0, 0.0),
+                                        rect.left_center() + egui::vec2(38.0, 0.0),
                                         Align2::LEFT_CENTER,
                                         name,
                                         font.clone(),
                                         if c.is_dir { th.dir } else { th.fg },
                                     );
+
                                     if let Some(s) = c.size {
                                         ui.painter().text(
-                                            rect.right_center() - egui::vec2(12.0, 0.0),
+                                            rect.right_center() - egui::vec2(16.0, 0.0),
                                             Align2::RIGHT_CENTER,
                                             format_bytes(s),
                                             FontId::proportional(th.font - 1.5),
                                             th.dim,
+                                        );
+                                    } else if c.is_dir {
+                                        ui.painter().text(
+                                            rect.right_center() - egui::vec2(16.0, 0.0),
+                                            Align2::RIGHT_CENTER,
+                                            "—",
+                                            FontId::proportional(th.font - 1.5),
+                                            th.dim.gamma_multiply(0.5),
                                         );
                                     }
 
@@ -933,47 +1063,116 @@ impl FilesApp {
                                             open_member = Some(c.path.clone());
                                         }
                                     }
-                                    if !c.is_dir {
-                                        resp.context_menu(|ui| {
+                                    if resp.drag_started() {
+                                        let grab_offset = resp.interact_pointer_pos().map(|p| p - rect.min).unwrap_or(rect.size() * 0.5);
+                                        start_archive_drag = Some((c.path.clone(), name.to_string(), c.is_dir, c.size, rect, grab_offset));
+                                    }
+
+                                    let archive_parent = av.archive.parent().map(Path::to_path_buf).unwrap_or_default();
+                                    resp.context_menu(|ui| {
+                                        if !c.is_dir {
                                             if ui.button("Open").clicked() {
                                                 open_member = Some(c.path.clone());
                                                 ui.close_menu();
                                             }
-                                            if ui.button("Extract next to the archive").clicked() {
-                                                extract_member_here = Some(c.path.clone());
-                                                ui.close_menu();
-                                            }
-                                        });
-                                    }
+                                        }
+                                        if ui.button("Extract next to archive").clicked() {
+                                            extract_member_to = Some((c.path.clone(), c.is_dir, archive_parent));
+                                            ui.close_menu();
+                                        }
+                                    });
                                 }
-                            });
-                    }
+                            }
+                        });
                 }
-            });
-        let archive = av.archive.clone();
-        if let Some(into_folder) = extract_all {
-            self.apply(Action::Extract { archive: archive.clone(), into_folder });
+            }
         }
+
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if !av.dir.is_empty() {
+                av.dir = av.dir.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
+                av.selected = None;
+            } else {
+                exit_archive = true;
+            }
+        }
+
+        let archive = av.archive.clone();
+
+        if exit_archive {
+            self.tools.archive = None;
+        }
+
+        if trigger_export_folder {
+            let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
+            let name = display_name(&archive);
+            let stem = archive_stem(&name).to_string();
+            self.export_folder_prompt = Some(ExportFolderPrompt {
+                archive: archive.clone(),
+                dest_dir: parent,
+                folder_name: stem,
+                initial_focus: true,
+            });
+        }
+
+        if trigger_export_here {
+            let parent = archive.parent().map(Path::to_path_buf).unwrap_or_default();
+            let has_other_items = std::fs::read_dir(&parent).map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| e.path() != archive)
+            }).unwrap_or(false);
+
+            if has_other_items {
+                let name = display_name(&archive);
+                let stem = archive_stem(&name).to_string();
+                self.export_here_prompt = Some(ExportHerePrompt {
+                    archive: archive.clone(),
+                    dest_dir: parent,
+                    folder_name: stem,
+                    initial_focus: true,
+                });
+            } else {
+                let name = display_name(&archive);
+                let archive_path = archive.clone();
+                let dest = parent.clone();
+                self.spawn_job(format!("Extracting {name}"), format!("To {}", dest.display()), move |progress| {
+                    extract_archive(&archive_path, &dest, progress)
+                        .map(|_| format!("Extracted {name}"))
+                        .map_err(|e| format!("Extract failed: {e}"))
+                });
+            }
+        }
+
+        if let Some((member, name, is_dir, size, origin_rect, grab_offset)) = start_archive_drag {
+            self.archive_drag = Some(ArchiveDrag {
+                archive: archive.clone(),
+                member,
+                name,
+                is_dir,
+                size,
+                origin_rect,
+                grab_offset,
+            });
+            self.archive_snap_back = None;
+        }
+
         if let Some(member) = open_member {
             let tmp = std::env::temp_dir().join("chickenwm-files").join(format!("{:x}", fxhash(&archive.to_string_lossy())));
-            match extract_member(&archive, &member, &tmp) {
+            match extract_archive_member(&archive, &member, false, &tmp) {
                 Ok(path) => shell::shell_open(self.hwnd, &path, None),
                 Err(e) => self.toast(format!("Couldn't open {member}: {e}"), true),
             }
         }
-        if let Some(member) = extract_member_here {
-            let dest = archive.parent().map(Path::to_path_buf).unwrap_or_default();
-            match extract_member(&archive, &member, &dest) {
-                Ok(path) => {
-                    self.push_undo(UndoOp::Created(vec![path.clone()]));
-                    self.toast(format!("Extracted {}", display_name(&path)), false);
-                    self.dirty.store(true, Ordering::Relaxed);
-                }
-                Err(e) => self.toast(format!("Extract failed: {e}"), true),
-            }
-        }
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.tools.archive = None;
+
+        if let Some((member, is_dir, dest)) = extract_member_to {
+            let name = member.rsplit('/').next().unwrap_or(&member).to_string();
+            let archive_path = archive.clone();
+            let dest_target = dest.clone();
+            self.spawn_job(format!("Extracting {name}"), format!("To {}", dest.display()), move |_| {
+                extract_archive_member(&archive_path, &member, is_dir, &dest_target)
+                    .map(|p| format!("Extracted {}", display_name(&p)))
+                    .map_err(|e| format!("Extract failed: {e}"))
+            });
+            self.toast(format!("Extracting {name} to {}", display_name(&dest)), false);
         }
     }
 }
@@ -1324,7 +1523,6 @@ impl FilesApp {
         }
         self.batch_rename_window(ctx, th);
         self.disk_usage_window(ctx, th);
-        self.archive_window(ctx, th);
         self.go_anywhere_window(ctx, th);
     }
 
