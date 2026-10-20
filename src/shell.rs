@@ -31,7 +31,7 @@ use windows::Win32::UI::Shell::{
     DefSubclassProc, DragQueryFileW, ILFindLastID, ILFree, IContextMenu, IContextMenu2,
     IContextMenu3, IShellFolder, IShellLinkW, RemoveWindowSubclass, SHBindToParent,
     SHFileOperationW, SHMultiFileProperties, SHObjectProperties, SHOpenWithDialog,
-    SHParseDisplayName, SetWindowSubclass, ShellExecuteW, ShellLink, CMF_NORMAL,
+    SHParseDisplayName, SetWindowSubclass, ShellLink, CMF_NORMAL,
     CMINVOKECOMMANDINFO, DROPFILES, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_RENAMEONCOLLISION,
     FOF_WANTNUKEWARNING, FO_COPY, FO_DELETE, FO_MOVE, HDROP, OAIF_ALLOW_REGISTRATION, OAIF_EXEC,
     OAIF_REGISTER_EXT, OPENASINFO, SHOP_FILEPATH,
@@ -348,19 +348,8 @@ pub fn native_context_menu(hwnd: HWND, paths: &[PathBuf]) -> bool {
     }
 }
 
-pub fn shell_open(hwnd: HWND, path: &Path, verb: Option<&str>) {
-    let verb_w = verb.map(|v| HSTRING::from(v));
-    let dir = path.parent().map(|p| HSTRING::from(p.as_os_str()));
-    unsafe {
-        ShellExecuteW(
-            hwnd,
-            verb_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
-            &HSTRING::from(path.as_os_str()),
-            PCWSTR::null(),
-            dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
-            SW_SHOWNORMAL,
-        );
-    }
+pub fn shell_open(_hwnd: HWND, path: &Path, verb: Option<&str>) {
+    chickenwm_core::elevation::shell_open_unelevated(path, None, verb);
 }
 
 pub fn open_with(hwnd: HWND, path: &Path) {

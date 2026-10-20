@@ -313,8 +313,8 @@ impl EmbeddedTerminal {
                         self.lines.clear();
                     }
                     if ui.button(egui::RichText::new("External ↗").size(th.font - 2.0)).on_hover_text("Open in Windows Terminal (wt.exe)").clicked() {
-                        let _ = Command::new("wt.exe").arg("-d").arg(&self.cwd).spawn()
-                            .or_else(|_| Command::new("cmd.exe").arg("/c").arg("start").arg("cmd.exe").current_dir(&self.cwd).spawn());
+                        let wt_args = format!("-d \"{}\"", self.cwd.display());
+                        chickenwm_core::elevation::shell_open_unelevated(std::path::Path::new("wt.exe"), Some(&wt_args), None);
                     }
                 });
             });
