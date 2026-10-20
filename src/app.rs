@@ -88,6 +88,7 @@ enum Action {
     Terminal(PathBuf),
     /// Add a folder to the sidebar's Favorites.
     Pin(PathBuf),
+    PinAt { path: PathBuf, index: usize },
     /// Remove it from Favorites.
     Unpin(PathBuf),
     MoveFavorite { from: usize, to: usize },
@@ -212,7 +213,9 @@ impl Theme {
         ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
         let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = self.bg;
-        v.window_fill = self.pane;
+        // Acrylic frosted-glass translucent background for context menus and popups
+        let menu_bg = Color32::from_rgba_unmultiplied(self.sidebar.r(), self.sidebar.g(), self.sidebar.b(), 180);
+        v.window_fill = menu_bg;
         v.extreme_bg_color = self.sidebar;
         v.faint_bg_color = self.pane;
         v.override_text_color = Some(self.fg);
@@ -222,6 +225,12 @@ impl Theme {
         v.window_stroke = Stroke::new(1.0_f32, self.hairline());
         v.window_corner_radius = CornerRadius::same(self.radius);
         v.menu_corner_radius = CornerRadius::same(self.radius.min(8));
+        v.popup_shadow = egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_black_alpha(100),
+        };
         for w in [
             &mut v.widgets.noninteractive,
             &mut v.widgets.inactive,
@@ -329,6 +338,7 @@ pub struct FilesApp {
     pending_focus: Option<(Side, PathBuf)>,
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
+    fav_drop_hover: bool,
     jobs: Arc<Jobs>,
     dirty: Arc<AtomicBool>,
     last_reload: Instant,
@@ -516,6 +526,7 @@ impl FilesApp {
             pending_focus: None,
             zones: Vec::new(),
             drop_menu: None,
+            fav_drop_hover: false,
             jobs: Arc::new(Jobs {
                 running: AtomicUsize::new(0),
                 status: Mutex::new(String::new()),
@@ -837,6 +848,10 @@ impl FilesApp {
             }
             Action::Pin(path) => {
                 self.prefs.add_favorite(path);
+                self.prefs.save();
+            }
+            Action::PinAt { path, index } => {
+                self.prefs.insert_favorite(path, index);
                 self.prefs.save();
             }
             Action::Unpin(path) => {
@@ -2259,6 +2274,7 @@ impl eframe::App for FilesApp {
         }
 
         self.zones.clear();
+        self.fav_drop_hover = false;
         let mut commit_rename = false;
         self.draw_sidebar(ctx, theme, &mut actions);
         self.draw_status(ctx, theme);
@@ -2754,9 +2770,11 @@ impl FilesApp {
                     let cwd = self.pane(self.focused()).cwd.clone();
                     let side = self.focused();
 
+                    let is_folder_drag = self.drag.as_ref().map_or(false, |d| d.paths.iter().any(|p| p.is_dir()));
                     if self.sidebar_section(ui, th, "Favorites", &cwd, actions) {
                         let favorites = self.prefs.favorites().to_vec();
                         let mut rows = Vec::with_capacity(favorites.len());
+                        let fav_start_y = ui.cursor().top();
                         for (i, fav) in favorites.iter().enumerate() {
                             let key = format!("path:{}", fav.path.display());
                             let resp = self.sidebar_item(ui, th, &fav.label(), &key, &fav.path, cwd == fav.path, side, Some(i), None, actions);
@@ -2767,8 +2785,52 @@ impl FilesApp {
                         }
                         if favorites.is_empty() {
                             ui.add_space(2.0);
-                            ui.label(egui::RichText::new("Add folders with + or by right-clicking them").small().color(th.dim));
+                            let r = ui.label(egui::RichText::new("Add folders with + or drag them here").small().color(th.dim)).rect;
+                            rows.push(r);
                         }
+                        let fav_end_y = ui.cursor().bottom() + 10.0;
+                        let fav_rect = Rect::from_min_max(
+                            Pos2::new(ui.min_rect().left(), fav_start_y - 24.0),
+                            Pos2::new(ui.min_rect().right(), fav_end_y),
+                        );
+
+                        // Drag folders directly into Favorites section
+                        if is_folder_drag {
+                            if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+                                if fav_rect.contains(pointer) {
+                                    self.fav_drop_hover = true;
+                                    let to = rows.iter().position(|r| pointer.y < r.center().y).unwrap_or(favorites.len());
+                                    let y = if to < rows.len() {
+                                        rows[to].top()
+                                    } else if !rows.is_empty() {
+                                        rows[rows.len() - 1].bottom()
+                                    } else {
+                                        fav_start_y
+                                    };
+                                    let left = ui.min_rect().left() + 8.0;
+                                    let right = ui.min_rect().right() - 8.0;
+
+                                    // Visual drop indicator line & circle
+                                    ui.painter().line_segment([Pos2::new(left + 6.0, y), Pos2::new(right, y)], Stroke::new(2.5_f32, th.accent));
+                                    ui.painter().circle_filled(Pos2::new(left + 4.0, y), 3.5, th.accent);
+
+                                    // Drop onto Favorites
+                                    if ui.input(|i| i.pointer.any_released()) {
+                                        if let Some(drag) = self.drag.take() {
+                                            let mut insert_idx = to;
+                                            for p in drag.paths {
+                                                if p.is_dir() {
+                                                    actions.push(Action::PinAt { path: p, index: insert_idx });
+                                                    insert_idx += 1;
+                                                }
+                                            }
+                                            self.toast("Added to Favorites", false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         self.favorite_reorder(ui, th, &rows, &favorites, actions);
                     }
 
@@ -2951,8 +3013,11 @@ impl FilesApp {
         if let Some((free, total)) = space {
             resp.clone().on_hover_text(format!("{} free of {}", format_bytes(free), format_bytes(total)));
         }
-        if self.fav_drag.is_none() {
-            // Files dropped on a sidebar folder go into it.
+        let is_favorite = favorite.is_some();
+        let is_folder_drag = self.drag.as_ref().map_or(false, |d| d.paths.iter().any(|p| p.is_dir()));
+        if self.fav_drag.is_none() && (!is_favorite || !is_folder_drag) {
+            // Files dropped on a sidebar folder go into it. But when dragging a folder over Favorites,
+            // we pin it to Favorites instead of moving into a subfolder!
             self.zones.push(DropZone { rect, dir: path.to_path_buf() });
         }
         let path = path.to_path_buf();
@@ -2969,17 +3034,13 @@ impl FilesApp {
                 actions.push(Action::OpenNewTab(path.clone()));
                 ui.close_menu();
             }
-            if ui.button("Paste").clicked() {
-                actions.push(Action::Paste(path.clone()));
-                ui.close_menu();
-            }
             if ui.button("Open in Terminal").clicked() {
                 actions.push(Action::Terminal(path.clone()));
                 ui.close_menu();
             }
             ui.separator();
             if is_favorite {
-                if ui.button("Rename…").clicked() {
+                if ui.button("Rename favorite…").clicked() {
                     rename = Some(label.clone());
                     ui.close_menu();
                 }
@@ -3253,12 +3314,16 @@ impl FilesApp {
         if let Some(p) = pointer {
             let n = drag.paths.len();
             let what = if n == 1 { display_name(&drag.paths[0]) } else { format!("{n} items") };
-            let text = match (target, kind, drag.secondary) {
-                (Some(z), _, true) => format!("{what} ➡ {}  (release for options)", display_name(&z.dir)),
-                (Some(z), Some(DropKind::Copy), _) => format!("+ Copy {what} to {}", display_name(&z.dir)),
-                (Some(z), Some(DropKind::Shortcut), _) => format!("🔗 Create shortcut in {}", display_name(&z.dir)),
-                (Some(z), _, _) => format!("➡ Move {what} to {}", display_name(&z.dir)),
-                (None, _, _) => format!("{what}  (drag outside to drop into another app)"),
+            let text = if self.fav_drop_hover {
+                format!("📌 Add {what} to Favorites")
+            } else {
+                match (target, kind, drag.secondary) {
+                    (Some(z), _, true) => format!("{what} ➡ {}  (release for options)", display_name(&z.dir)),
+                    (Some(z), Some(DropKind::Copy), _) => format!("+ Copy {what} to {}", display_name(&z.dir)),
+                    (Some(z), Some(DropKind::Shortcut), _) => format!("🔗 Create shortcut in {}", display_name(&z.dir)),
+                    (Some(z), _, _) => format!("➡ Move {what} to {}", display_name(&z.dir)),
+                    (None, _, _) => format!("{what}  (drag outside to drop into another app)"),
+                }
             };
             let galley = painter.layout_no_wrap(text, FontId::proportional(th.font - 1.0), th.fg);
             let rect = Rect::from_min_size(p + egui::vec2(16.0, 18.0), galley.size() + egui::vec2(16.0, 10.0));

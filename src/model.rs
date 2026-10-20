@@ -128,6 +128,16 @@ impl Prefs {
         }
     }
 
+    pub fn insert_favorite(&mut self, path: PathBuf, index: usize) {
+        let list = self.favorites.get_or_insert_with(Vec::new);
+        if let Some(pos) = list.iter().position(|f| f.path == path) {
+            self.move_favorite(pos, index);
+        } else {
+            let idx = index.min(list.len());
+            list.insert(idx, Favorite::new(path));
+        }
+    }
+
     pub fn remove_favorite(&mut self, path: &Path) {
         if let Some(list) = self.favorites.as_mut() {
             list.retain(|f| f.path != path);
