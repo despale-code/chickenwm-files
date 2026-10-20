@@ -112,7 +112,15 @@ enum Action {
     Back(Side),
     Forward(Side),
     Up(Side),
-    BeginDrag { paths: Vec<PathBuf>, secondary: bool },
+    BeginDrag {
+        paths: Vec<PathBuf>,
+        secondary: bool,
+        origin_rect: Rect,
+        grab_offset: Vec2,
+        icon_key: String,
+        is_dir: bool,
+        name: String,
+    },
     EditAddress,
     FocusSearch,
     /// Several items: rename them together (find / replace, numbering).
@@ -270,6 +278,22 @@ struct Rename {
 struct Drag {
     paths: Vec<PathBuf>,
     secondary: bool,
+    origin_rect: Rect,
+    grab_offset: Vec2,
+    icon_key: String,
+    is_dir: bool,
+    name: String,
+}
+
+struct SnapBackAnim {
+    path: PathBuf,
+    icon_key: String,
+    is_dir: bool,
+    name: String,
+    start_rect: Rect,
+    target_rect: Rect,
+    start_time: Instant,
+    duration: Duration,
 }
 
 /// A place something can be dropped on, collected while drawing each frame.
@@ -339,6 +363,7 @@ pub struct FilesApp {
     zones: Vec<DropZone>,
     drop_menu: Option<DropMenu>,
     fav_drop_hover: bool,
+    snap_back: Option<SnapBackAnim>,
     jobs: Arc<Jobs>,
     dirty: Arc<AtomicBool>,
     last_reload: Instant,
@@ -527,6 +552,7 @@ impl FilesApp {
             zones: Vec::new(),
             drop_menu: None,
             fav_drop_hover: false,
+            snap_back: None,
             jobs: Arc::new(Jobs {
                 running: AtomicUsize::new(0),
                 status: Mutex::new(String::new()),
@@ -974,9 +1000,10 @@ impl FilesApp {
             Action::Back(side) => self.pane_mut(side).go_back(&prefs),
             Action::Forward(side) => self.pane_mut(side).go_forward(&prefs),
             Action::Up(side) => self.pane_mut(side).go_up(&prefs),
-            Action::BeginDrag { paths, secondary } => {
+            Action::BeginDrag { paths, secondary, origin_rect, grab_offset, icon_key, is_dir, name } => {
                 if !paths.is_empty() {
-                    self.drag = Some(Drag { paths, secondary });
+                    self.drag = Some(Drag { paths, secondary, origin_rect, grab_offset, icon_key, is_dir, name });
+                    self.snap_back = None;
                 }
             }
             Action::EditAddress => {
@@ -1454,6 +1481,8 @@ struct Draw<'a> {
     focused: bool,
     actions: &'a mut Vec<Action>,
     marquee: &'a mut Option<Marquee>,
+    snap_back: &'a Option<SnapBackAnim>,
+    drag_info: &'a Option<Drag>,
     /// Folder sizes and git badges for this frame.
     extras: &'a tools::RowExtras,
 }
@@ -1587,15 +1616,19 @@ fn paint_gear_icon(painter: &egui::Painter, rect: Rect, color: Color32) {
     }
 }
 
-fn paint_icon(ui: &egui::Ui, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
+fn paint_icon_painter(painter: &egui::Painter, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
     if let Some(tex) = icons.get(key, large) {
-        ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
     } else if fallback_dir {
-        paint_view_icons(ui.painter(), rect.shrink(4.0), theme.dim);
+        paint_view_icons(painter, rect.shrink(4.0), theme.dim);
     } else {
         let r = Rect::from_center_size(rect.center(), egui::vec2(rect.width() * 0.65, rect.height() * 0.75));
-        ui.painter().rect_stroke(r, CornerRadius::same(2), Stroke::new(1.2_f32, theme.dim), egui::StrokeKind::Inside);
+        painter.rect_stroke(r, CornerRadius::same(2), Stroke::new(1.2_f32, theme.dim), egui::StrokeKind::Inside);
     }
+}
+
+fn paint_icon(ui: &egui::Ui, icons: &mut IconCache, key: &str, large: bool, rect: Rect, fallback_dir: bool, theme: &Theme) {
+    paint_icon_painter(ui.painter(), icons, key, large, rect, fallback_dir, theme);
 }
 
 fn type_label(icons: &IconCache, e: &Entry) -> String {
@@ -1795,7 +1828,20 @@ impl Draw<'_> {
             }
             let paths = if selected { pane.targets() } else { vec![entry.path.clone()] };
             let secondary = resp.dragged_by(egui::PointerButton::Secondary);
-            self.actions.push(Action::BeginDrag { paths, secondary });
+            let grab_offset = if let Some(p) = resp.interact_pointer_pos() {
+                p - rect.min
+            } else {
+                rect.size() * 0.5
+            };
+            self.actions.push(Action::BeginDrag {
+                paths,
+                secondary,
+                origin_rect: rect,
+                grab_offset,
+                icon_key: entry.icon_key.clone(),
+                is_dir: entry.is_dir,
+                name: shown_name(entry, self.prefs).to_string(),
+            });
         }
         if entry.is_dir {
             self.zones.push(DropZone { rect, dir: entry.path.clone() });
@@ -1990,57 +2036,64 @@ impl Draw<'_> {
                     ui.add_space(4.0); // 4-pixel gap on left for mouse selection box drag
                     let row_w = (ui.available_width() - 4.0).max(60.0);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, row_h), Sense::click_and_drag());
-                    let selected = pane.selection.contains(&entry.path);
-                    // Finder's alternating row stripes.
-                    if pos % 2 == 1 && !selected {
-                        ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
-                    }
-                    self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
-                    if let Some(mbox) = marquee_box {
-                        if mbox.intersects(rect) {
-                            marquee_hits.push(entry.path.clone());
-                        }
-                    }
-                    let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
-                    paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
-                    let name_rect = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top() + 2.0), Pos2::new(rect.left() + 8.0 + name_w - 6.0, rect.bottom() - 2.0));
-                    if !self.rename_field(ui, entry, name_rect) {
-                        let painter = ui.painter().with_clip_rect(name_rect);
-                        let color = if entry.hidden { th.name_color(entry).gamma_multiply(0.55) } else { th.name_color(entry) };
-                        painter.text(name_rect.left_center(), Align2::LEFT_CENTER, shown_name(entry, self.prefs), FontId::proportional(th.font), color);
-                    }
-                    let mut cx = rect.left() + 8.0 + name_w;
-                    let small = FontId::proportional(th.font - 1.5);
-                    let date = entry.modified.map(format_time).unwrap_or_default();
-                    ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(date_w - 6.0, row_h)))
-                        .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, date, small.clone(), th.dim);
-                    cx += date_w;
-                    if type_w > 0.0 {
-                        ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(type_w - 6.0, row_h)))
-                            .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, type_label(self.icons, entry), small.clone(), th.dim);
-                        cx += type_w;
-                    }
-                    let size_text = if entry.is_dir {
-                        self.extras.sizes.get(&entry.path).map(|s| s.map(format_bytes).unwrap_or_else(|| "…".to_owned()))
+                    let is_being_dragged = self.drag_info.as_ref().is_some_and(|d| d.paths.contains(&entry.path));
+                    let is_snapping = self.snap_back.as_ref().is_some_and(|s| s.path == entry.path);
+                    if is_being_dragged || is_snapping {
+                        // Empty slot on the back; row stays intact so layout doesn't collapse
+                        ui.painter().rect_stroke(rect, CornerRadius::same(th.radius.min(6)), Stroke::new(1.0_f32, th.hairline().gamma_multiply(0.25)), egui::StrokeKind::Inside);
                     } else {
-                        Some(format_bytes(entry.size))
-                    };
-                    if let Some(text) = size_text {
-                        ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, text, small.clone(), th.dim);
-                    }
-                    if let Some(&letter) = self.extras.git.get(&entry.path) {
-                        let badge_color = tools::git_badge_color(letter, &th);
-                        let badge_size = Vec2::new(16.0, 15.0);
-                        let badge_rect = Rect::from_center_size(Pos2::new(name_rect.right() - 10.0, rect.center().y), badge_size);
-                        ui.painter().rect_filled(badge_rect, CornerRadius::same(3), badge_color.gamma_multiply(0.18));
-                        ui.painter().rect_stroke(badge_rect, CornerRadius::same(3), Stroke::new(1.0_f32, badge_color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-                        ui.painter().text(
-                            badge_rect.center(),
-                            Align2::CENTER_CENTER,
-                            letter.to_string(),
-                            FontId::monospace(th.font - 3.0),
-                            badge_color,
-                        );
+                        let selected = pane.selection.contains(&entry.path);
+                        // Finder's alternating row stripes.
+                        if pos % 2 == 1 && !selected {
+                            ui.painter().rect_filled(rect, CornerRadius::same(th.radius.min(6)), th.fg.gamma_multiply(0.025));
+                        }
+                        self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
+                        if let Some(mbox) = marquee_box {
+                            if mbox.intersects(rect) {
+                                marquee_hits.push(entry.path.clone());
+                            }
+                        }
+                        let icon = Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
+                        paint_icon(ui, self.icons, &entry.icon_key, false, icon, entry.is_dir, &th);
+                        let name_rect = Rect::from_min_max(Pos2::new(rect.left() + 32.0, rect.top() + 2.0), Pos2::new(rect.left() + 8.0 + name_w - 6.0, rect.bottom() - 2.0));
+                        if !self.rename_field(ui, entry, name_rect) {
+                            let painter = ui.painter().with_clip_rect(name_rect);
+                            let color = if entry.hidden { th.name_color(entry).gamma_multiply(0.55) } else { th.name_color(entry) };
+                            painter.text(name_rect.left_center(), Align2::LEFT_CENTER, shown_name(entry, self.prefs), FontId::proportional(th.font), color);
+                        }
+                        let mut cx = rect.left() + 8.0 + name_w;
+                        let small = FontId::proportional(th.font - 1.5);
+                        let date = entry.modified.map(format_time).unwrap_or_default();
+                        ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(date_w - 6.0, row_h)))
+                            .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, date, small.clone(), th.dim);
+                        cx += date_w;
+                        if type_w > 0.0 {
+                            ui.painter().with_clip_rect(Rect::from_min_size(Pos2::new(cx, rect.top()), egui::vec2(type_w - 6.0, row_h)))
+                               .text(Pos2::new(cx + 4.0, rect.center().y), Align2::LEFT_CENTER, type_label(self.icons, entry), small.clone(), th.dim);
+                            cx += type_w;
+                        }
+                        let size_text = if entry.is_dir {
+                            self.extras.sizes.get(&entry.path).map(|s| s.map(format_bytes).unwrap_or_else(|| "…".to_owned()))
+                        } else {
+                            Some(format_bytes(entry.size))
+                        };
+                        if let Some(text) = size_text {
+                            ui.painter().text(Pos2::new(cx + size_w - 6.0, rect.center().y), Align2::RIGHT_CENTER, text, small.clone(), th.dim);
+                        }
+                        if let Some(&letter) = self.extras.git.get(&entry.path) {
+                            let badge_color = tools::git_badge_color(letter, &th);
+                            let badge_size = Vec2::new(16.0, 15.0);
+                            let badge_rect = Rect::from_center_size(Pos2::new(name_rect.right() - 10.0, rect.center().y), badge_size);
+                            ui.painter().rect_filled(badge_rect, CornerRadius::same(3), badge_color.gamma_multiply(0.18));
+                            ui.painter().rect_stroke(badge_rect, CornerRadius::same(3), Stroke::new(1.0_f32, badge_color.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                            ui.painter().text(
+                                badge_rect.center(),
+                                Align2::CENTER_CENTER,
+                                letter.to_string(),
+                                FontId::monospace(th.font - 3.0),
+                                badge_color,
+                            );
+                        }
                     }
                     self.interact(&resp, side, pos, entry, pane, rect, dual);
                 });
@@ -2129,36 +2182,43 @@ impl Draw<'_> {
                         let (slot_rect, _) = ui.allocate_exact_size(tile, Sense::hover());
                         let rect = slot_rect.shrink2(egui::vec2(2.0, 2.0));
                         let resp = ui.interact(rect, ui.id().with(("item", side, pos)), Sense::click_and_drag());
-                        let selected = pane.selection.contains(&entry.path);
-                        self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
+                        let is_being_dragged = self.drag_info.as_ref().is_some_and(|d| d.paths.contains(&entry.path));
+                        let is_snapping = self.snap_back.as_ref().is_some_and(|s| s.path == entry.path);
+                        if is_being_dragged || is_snapping {
+                            // Empty slot on the back; grid layout does NOT align/shift until item moves elsewhere
+                            ui.painter().rect_stroke(rect, CornerRadius::same(th.radius.min(6)), Stroke::new(1.0_f32, th.hairline().gamma_multiply(0.25)), egui::StrokeKind::Inside);
+                        } else {
+                            let selected = pane.selection.contains(&entry.path);
+                            self.row_background(ui, rect, &resp, selected, pos == pane.cursor);
 
-                        if let Some(mbox) = marquee_box {
-                            if mbox.intersects(rect) {
-                                marquee_hits.push(entry.path.clone());
+                            if let Some(mbox) = marquee_box {
+                                if mbox.intersects(rect) {
+                                    marquee_hits.push(entry.path.clone());
+                                }
                             }
-                        }
 
-                        let icon_size = (50.4 * scale).round();
-                        let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (31.0 * scale).round()), Vec2::splat(icon_size));
-                        paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
-                        let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (58.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
-                        let rename_w = (rect.width() * 0.80).round();
-                        let rename_rect = Rect::from_center_size(Pos2::new(rect.center().x, label_rect.top() + 12.0), Vec2::new(rename_w, 24.0));
-                        if !self.rename_field(ui, entry, rename_rect) {
-                            let font_size = (th.font - 1.5) * scale.clamp(0.85, 1.3);
-                            let mut job = egui::text::LayoutJob::simple(
-                                shown_name(entry, self.prefs),
-                                FontId::proportional(font_size),
-                                th.name_color(entry),
-                                label_rect.width(),
-                            );
-                            job.wrap.max_rows = 2;
-                            job.wrap.overflow_character = Some('…');
-                            job.halign = egui::Align::Center;
-                            let galley = ui.fonts(|f| f.layout_job(job));
-                            let painter = ui.painter().with_clip_rect(label_rect);
-                            let x = label_rect.center().x - galley.size().x / 2.0;
-                            painter.galley(Pos2::new(x, label_rect.top()), galley, th.fg);
+                            let icon_size = (50.4 * scale).round();
+                            let icon = Rect::from_center_size(Pos2::new(rect.center().x, rect.top() + (31.0 * scale).round()), Vec2::splat(icon_size));
+                            paint_icon(ui, self.icons, &entry.icon_key, true, icon, entry.is_dir, &th);
+                            let label_rect = Rect::from_min_max(Pos2::new(rect.left() + 4.0, rect.top() + (58.0 * scale).round()), Pos2::new(rect.right() - 4.0, rect.bottom() - 2.0));
+                            let rename_w = (rect.width() * 0.80).round();
+                            let rename_rect = Rect::from_center_size(Pos2::new(rect.center().x, label_rect.top() + 12.0), Vec2::new(rename_w, 24.0));
+                            if !self.rename_field(ui, entry, rename_rect) {
+                                let font_size = (th.font - 1.5) * scale.clamp(0.85, 1.3);
+                                let mut job = egui::text::LayoutJob::simple(
+                                    shown_name(entry, self.prefs),
+                                    FontId::proportional(font_size),
+                                    th.name_color(entry),
+                                    label_rect.width(),
+                                );
+                                job.wrap.max_rows = 2;
+                                job.wrap.overflow_character = Some('…');
+                                job.halign = egui::Align::Center;
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                let painter = ui.painter().with_clip_rect(label_rect);
+                                let x = label_rect.center().x - galley.size().x / 2.0;
+                                painter.galley(Pos2::new(x, label_rect.top()), galley, th.fg);
+                            }
                         }
                         self.interact(&resp, side, pos, entry, pane, rect, false);
                     }
@@ -3151,6 +3211,8 @@ impl FilesApp {
                 focused: true,
                 actions,
                 marquee: &mut self.marquee,
+                snap_back: &self.snap_back,
+                drag_info: &self.drag,
                 extras: &extras,
             };
             match view {
@@ -3319,23 +3381,63 @@ impl FilesApp {
             painter.rect_stroke(z.rect.expand(1.0), CornerRadius::same(th.radius.min(6)), Stroke::new(2.0_f32, th.accent), egui::StrokeKind::Outside);
         }
         if let Some(p) = pointer {
-            let n = drag.paths.len();
-            let what = if n == 1 { display_name(&drag.paths[0]) } else { format!("{n} items") };
-            let text = if self.fav_drop_hover {
-                format!("📌 Add {what} to Favorites")
-            } else {
-                match (target, kind, drag.secondary) {
-                    (Some(z), _, true) => format!("{what} ➡ {}  (release for options)", display_name(&z.dir)),
-                    (Some(z), Some(DropKind::Copy), _) => format!("+ Copy {what} to {}", display_name(&z.dir)),
-                    (Some(z), Some(DropKind::Shortcut), _) => format!("🔗 Create shortcut in {}", display_name(&z.dir)),
-                    (Some(z), _, _) => format!("➡ Move {what} to {}", display_name(&z.dir)),
-                    (None, _, _) => format!("{what}  (drag outside to drop into another app)"),
+            let tile_pos = p - drag.grab_offset;
+            let tile_rect = Rect::from_min_size(tile_pos, drag.origin_rect.size());
+
+            // 1. Floating tile shadow & background
+            painter.rect_filled(tile_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(75));
+            painter.rect_filled(tile_rect, CornerRadius::same(th.radius.min(8)), th.pane);
+            painter.rect_stroke(tile_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.5_f32, th.accent), egui::StrokeKind::Inside);
+
+            // 2. Icon inside moving tile
+            let icon_size = (tile_rect.height() * 0.46).clamp(24.0, 52.0);
+            let icon_y = tile_rect.top() + icon_size * 0.5 + 8.0;
+            let icon_rect = Rect::from_center_size(Pos2::new(tile_rect.center().x, icon_y), Vec2::splat(icon_size));
+            paint_icon_painter(&painter, &mut self.icons, &drag.icon_key, true, icon_rect, drag.is_dir, &th);
+
+            // 3. Label inside moving tile
+            let font_size = (th.font - 1.5).max(10.0);
+            let mut job = egui::text::LayoutJob::simple(
+                drag.name.clone(),
+                FontId::proportional(font_size),
+                th.fg,
+                (tile_rect.width() - 8.0).max(40.0),
+            );
+            job.wrap.max_rows = 2;
+            job.wrap.overflow_character = Some('…');
+            job.halign = egui::Align::Center;
+            let galley = ctx.fonts(|f| f.layout_job(job));
+            let lx = tile_rect.center().x - galley.size().x / 2.0;
+            let ly = (icon_rect.bottom() + 4.0).min(tile_rect.bottom() - 16.0);
+            painter.galley(Pos2::new(lx, ly), galley, th.fg);
+
+            // 4. Count badge for multi-item drag
+            if drag.paths.len() > 1 {
+                let badge_rect = Rect::from_center_size(Pos2::new(tile_rect.right() - 4.0, tile_rect.top() + 4.0), Vec2::splat(18.0));
+                painter.rect_filled(badge_rect, CornerRadius::same(9), th.accent);
+                painter.text(badge_rect.center(), Align2::CENTER_CENTER, drag.paths.len().to_string(), FontId::proportional(th.font - 3.0), Color32::WHITE);
+            }
+
+            // 5. Target / Action hint badge
+            let hint = if self.fav_drop_hover {
+                Some("📌 Add to Favorites".to_string())
+            } else if let Some(z) = target {
+                let what = if drag.paths.len() == 1 { display_name(&drag.paths[0]) } else { format!("{} items", drag.paths.len()) };
+                match (kind, drag.secondary) {
+                    (_, true) => Some(format!("{what} ➡ {} (options)", display_name(&z.dir))),
+                    (Some(DropKind::Copy), _) => Some(format!("+ Copy {what} to {}", display_name(&z.dir))),
+                    (Some(DropKind::Shortcut), _) => Some(format!("🔗 Shortcut in {}", display_name(&z.dir))),
+                    _ => Some(format!("➡ Move {what} to {}", display_name(&z.dir))),
                 }
+            } else {
+                None
             };
-            let galley = painter.layout_no_wrap(text, FontId::proportional(th.font - 1.0), th.fg);
-            let rect = Rect::from_min_size(p + egui::vec2(16.0, 18.0), galley.size() + egui::vec2(16.0, 10.0));
-            painter.rect(rect, CornerRadius::same(6), th.pane, Stroke::new(1.0_f32, th.accent.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-            painter.galley(rect.min + egui::vec2(8.0, 5.0), galley, th.fg);
+            if let Some(text) = hint {
+                let h_galley = painter.layout_no_wrap(text, FontId::proportional(th.font - 1.5), th.fg);
+                let h_rect = Rect::from_min_size(p + egui::vec2(16.0, 16.0), h_galley.size() + egui::vec2(16.0, 8.0));
+                painter.rect(h_rect, CornerRadius::same(6), th.pane, Stroke::new(1.0_f32, th.accent), egui::StrokeKind::Inside);
+                painter.galley(h_rect.min + egui::vec2(8.0, 4.0), h_galley, th.fg);
+            }
         }
         if released || !any_down {
             let drag = self.drag.take().unwrap();
@@ -3345,6 +3447,65 @@ impl FilesApp {
                 } else {
                     actions.push(Action::Transfer { sources: drag.paths, dest: z, kind });
                 }
+            }
+            else if !self.fav_drop_hover {
+                let start_pos = pointer.map(|p| p - drag.grab_offset).unwrap_or(drag.origin_rect.min);
+                let start_rect = Rect::from_min_size(start_pos, drag.origin_rect.size());
+                self.snap_back = Some(SnapBackAnim {
+                    path: drag.paths[0].clone(),
+                    icon_key: drag.icon_key,
+                    is_dir: drag.is_dir,
+                    name: drag.name,
+                    start_rect,
+                    target_rect: drag.origin_rect,
+                    start_time: Instant::now(),
+                    duration: Duration::from_millis(180),
+                });
+                ctx.request_repaint();
+            }
+        }
+
+        // Smooth snap-back animation when item is not moved elsewhere
+        if let Some(anim) = &self.snap_back {
+            let t = (anim.start_time.elapsed().as_secs_f32() / anim.duration.as_secs_f32()).clamp(0.0, 1.0);
+            if t < 1.0 {
+                let ease = 1.0 - (1.0 - t).powi(3); // smooth cubic ease out
+                let cur_min = anim.start_rect.min.lerp(anim.target_rect.min, ease);
+                let cur_rect = Rect::from_min_size(cur_min, anim.target_rect.size());
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("snapback")));
+
+                // Floating tile shadow & background (fading out)
+                let alpha = (60.0 * (1.0 - ease)) as u8;
+                painter.rect_filled(cur_rect.expand(2.0), CornerRadius::same(th.radius.min(8)), Color32::from_black_alpha(alpha));
+                painter.rect_filled(cur_rect, CornerRadius::same(th.radius.min(8)), th.pane);
+                painter.rect_stroke(cur_rect, CornerRadius::same(th.radius.min(8)), Stroke::new(1.2_f32, th.accent.gamma_multiply(1.0 - ease)), egui::StrokeKind::Inside);
+
+                // Icon
+                let icon_size = (cur_rect.height() * 0.46).clamp(24.0, 52.0);
+                let icon_y = cur_rect.top() + icon_size * 0.5 + 8.0;
+                let icon_rect = Rect::from_center_size(Pos2::new(cur_rect.center().x, icon_y), Vec2::splat(icon_size));
+                paint_icon_painter(&painter, &mut self.icons, &anim.icon_key, true, icon_rect, anim.is_dir, &th);
+
+                // Label
+                let font_size = (th.font - 1.5).max(10.0);
+                let mut job = egui::text::LayoutJob::simple(
+                    anim.name.clone(),
+                    FontId::proportional(font_size),
+                    th.fg,
+                    (cur_rect.width() - 8.0).max(40.0),
+                );
+                job.wrap.max_rows = 2;
+                job.wrap.overflow_character = Some('…');
+                job.halign = egui::Align::Center;
+                let galley = ctx.fonts(|f| f.layout_job(job));
+                let lx = cur_rect.center().x - galley.size().x / 2.0;
+                let ly = (icon_rect.bottom() + 4.0).min(cur_rect.bottom() - 16.0);
+                painter.galley(Pos2::new(lx, ly), galley, th.fg);
+
+                ctx.request_repaint();
+            } else {
+                self.snap_back = None;
+                ctx.request_repaint();
             }
         }
     }
