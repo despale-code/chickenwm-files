@@ -61,7 +61,7 @@ enum DropKind {
 enum Action {
     /// Folder: browse into it (in that pane). File: open with its default app.
     Open(Side, PathBuf),
-    OpenNewTab(PathBuf),
+    /*OpenNewTab(PathBuf),*/
     Navigate(Side, PathBuf),
     Click { side: Side, pos: usize, ctrl: bool, shift: bool },
     /// Right-click on an item: select it unless it's already part of the selection.
@@ -876,12 +876,12 @@ impl FilesApp {
                     shell::shell_open(self.hwnd, &path, None);
                 }
             }
-            Action::OpenNewTab(path) => {
+            /*Action::OpenNewTab(path) => {
                 let mut p = Pane::new(path);
                 p.rebuild(&prefs);
                 self.tabs.push(p);
                 self.active = self.tabs.len() - 1;
-            }
+            }*/
             Action::Navigate(side, path) => self.pane_mut(side).navigate(path, &prefs),
             Action::Click { side, pos, ctrl, shift } => {
                 self.focus = side;
@@ -1111,10 +1111,10 @@ impl FilesApp {
                 self.reload_all();
                 self.refresh_drives();
             }
-            Action::NewTab => {
+            /*Action::NewTab => {
                 let cwd = self.tabs[self.active].cwd.clone();
                 self.apply(Action::OpenNewTab(cwd));
-            }
+            }*/
             Action::CloseTab(i) => {
                 if self.tabs.len() > 1 && i < self.tabs.len() {
                     self.tabs.remove(i);
@@ -1846,7 +1846,7 @@ fn item_menu(ui: &mut egui::Ui, side: Side, entry: &Entry, targets: &[PathBuf], 
     let single = targets.len() <= 1;
     if entry.is_dir {
         item(ui, "Open", "Enter", Action::Open(side, entry.path.clone()));
-        item(ui, "Open in new tab", "", Action::OpenNewTab(entry.path.clone()));
+        //item(ui, "Open in new tab", "", Action::OpenNewTab(entry.path.clone()));
         if dual {
             let other = if side == Side::Main { Side::Second } else { Side::Main };
             item(ui, "Open in other pane", "", Action::Navigate(other, entry.path.clone()));
@@ -3388,9 +3388,9 @@ impl FilesApp {
         if resp.clicked() && !renaming {
             actions.push(Action::Navigate(side, path.to_path_buf()));
         }
-        if resp.middle_clicked() {
+        /*if resp.middle_clicked() {
             actions.push(Action::OpenNewTab(path.to_path_buf()));
-        }
+        }*/
         if let Some((free, total)) = space {
             resp.clone().on_hover_text(format!("{} free of {}", format_bytes(free), format_bytes(total)));
         }
@@ -3411,10 +3411,10 @@ impl FilesApp {
                 actions.push(Action::Navigate(side, path.clone()));
                 ui.close_menu();
             }
-            if ui.button("Open in new tab").clicked() {
+            /*if ui.button("Open in new tab").clicked() {
                 actions.push(Action::OpenNewTab(path.clone()));
                 ui.close_menu();
-            }
+            }*/
             if ui.button("Open in Terminal").clicked() {
                 actions.push(Action::Terminal(path.clone()));
                 ui.close_menu();
@@ -3935,7 +3935,7 @@ impl FilesApp {
                     start_rect,
                     target_rect: drag.origin_rect,
                     start_time: Instant::now(),
-                    duration: Duration::from_millis(180),
+                    duration: Duration::from_millis(80),
                 });
                 ctx.request_repaint();
             }
