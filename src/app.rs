@@ -102,7 +102,7 @@ enum Action {
     ToggleHidden,
     TogglePreview,
     Refresh,
-    NewTab,
+    //NewTab,
     CloseTab(usize),
     #[allow(dead_code)]
     DuplicateTab(usize),
@@ -1375,9 +1375,9 @@ impl FilesApp {
             if m.ctrl && pressed(egui::Key::H) {
                 actions.push(Action::ToggleHidden);
             }
-            if m.ctrl && pressed(egui::Key::T) {
+            /*if m.ctrl && pressed(egui::Key::T) {
                 actions.push(Action::NewTab);
-            }
+            }*/
             if m.ctrl && pressed(egui::Key::W) {
                 actions.push(Action::CloseTab(self.active));
             }
