@@ -61,6 +61,7 @@ struct Decoded {
     type_name: Option<String>,
     /// Icon theme the lookup was made for; results for a previous theme are dropped.
     theme: String,
+    pixelated: bool,
 }
 
 /// Special folder name (downloads, ...) for a path, if it is one.
@@ -188,6 +189,67 @@ fn downsample_icon_rgba(w: usize, h: usize, px: Vec<u8>, max_side: u32) -> (usiz
     }
 }
 
+fn trim_transparent_padding(w: usize, h: usize, px: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    if w == 0 || h == 0 || px.len() != w * h * 4 {
+        return None;
+    }
+    let mut min_x = w;
+    let mut max_x = 0;
+    let mut min_y = h;
+    let mut max_y = 0;
+    let mut has_visible = false;
+
+    for y in 0..h {
+        for x in 0..w {
+            let a = px[(y * w + x) * 4 + 3];
+            if a > 8 {
+                has_visible = true;
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+        }
+    }
+
+    if has_visible && min_x <= max_x && min_y <= max_y {
+        Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+    } else {
+        None
+    }
+}
+
+fn crop_rgba(w: usize, _h: usize, px: &[u8], x0: usize, y0: usize, bw: usize, bh: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bw * bh * 4);
+    for y in y0..(y0 + bh) {
+        let row_start = (y * w + x0) * 4;
+        let row_end = row_start + bw * 4;
+        out.extend_from_slice(&px[row_start..row_end]);
+    }
+    out
+}
+
+fn center_on_canvas(w: usize, h: usize, px: &[u8], canvas_size: usize) -> Vec<u8> {
+    if w == canvas_size && h == canvas_size {
+        return px.to_vec();
+    }
+    let mut out = vec![0u8; canvas_size * canvas_size * 4];
+    let offset_x = (canvas_size.saturating_sub(w)) / 2;
+    let offset_y = (canvas_size.saturating_sub(h)) / 2;
+    for y in 0..h {
+        let dest_y = offset_y + y;
+        if dest_y >= canvas_size { break; }
+        for x in 0..w {
+            let dest_x = offset_x + x;
+            if dest_x >= canvas_size { break; }
+            let src_idx = (y * w + x) * 4;
+            let dst_idx = (dest_y * canvas_size + dest_x) * 4;
+            out[dst_idx..dst_idx + 4].copy_from_slice(&px[src_idx..src_idx + 4]);
+        }
+    }
+    out
+}
+
 fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
     let themed = theme_request(key)
         .and_then(|req| theme.resolve(&req))
@@ -197,11 +259,40 @@ fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
     if themed.is_some() {
         decoded.rgba = themed;
     }
-    if let Some((w, h, px)) = decoded.rgba {
+    if let Some((mut w, mut h, px)) = decoded.rgba {
+        let mut premul_px = ensure_premultiplied(px);
+
+        // If Windows Shell returned a large canvas with a tiny legacy icon padded in the center,
+        // trim the transparent padding so we get the actual icon artwork.
+        if large && w >= 128 && h >= 128 {
+            if let Some((x0, y0, bw, bh)) = trim_transparent_padding(w, h, &premul_px) {
+                if bw <= 80 && bh <= 80 && (bw * 2 <= w || bh * 2 <= h) {
+                    premul_px = crop_rgba(w, h, &premul_px, x0, y0, bw, bh);
+                    w = bw;
+                    h = bh;
+                }
+            }
+        }
+
+        // For large icon layout (grid view): if an item only has a low-res icon (<= 64x64),
+        // scale it up to fit the 96px icon slot with Nearest-Neighbor filtering (pixelated, no blur!).
+        if large && w <= 64 && h <= 64 {
+            let scale_factor = (96.0 / (w.max(h) as f32)).max(1.0);
+            let target_w = ((w as f32 * scale_factor).round() as u32).clamp(1, 96);
+            let target_h = ((h as f32 * scale_factor).round() as u32).clamp(1, 96);
+            if let Some(src) = image::RgbaImage::from_raw(w as u32, h as u32, premul_px.clone()) {
+                let resized = image::imageops::resize(&src, target_w, target_h, image::imageops::FilterType::Nearest);
+                let centered = center_on_canvas(target_w as usize, target_h as usize, &resized.into_raw(), 96);
+                decoded.rgba = Some((96, 96, centered));
+                decoded.pixelated = true;
+                return decoded;
+            }
+        }
+
         let max_side = if large { 96 } else { 32 };
-        let premul_px = ensure_premultiplied(px);
         let (dw, dh, dpx) = downsample_icon_rgba(w, h, premul_px, max_side);
         decoded.rgba = Some((dw, dh, dpx));
+        decoded.pixelated = false;
     }
     decoded
 }
@@ -244,6 +335,7 @@ fn shell_lookup(key: &str, large: bool, name_only: bool) -> Decoded {
                     rgba: Some(rgba),
                     type_name,
                     theme: String::new(),
+                    pixelated: false,
                 };
             }
         }
@@ -302,6 +394,7 @@ fn shell_lookup(key: &str, large: bool, name_only: bool) -> Decoded {
         rgba,
         type_name,
         theme: String::new(),
+        pixelated: false,
     }
 }
 
@@ -439,7 +532,16 @@ impl IconCache {
             }
             let tex = d.rgba.map(|(w, h, px)| {
                 let img = egui::ColorImage::from_rgba_premultiplied([w, h], &px);
-                ctx.load_texture(format!("icon:{}:{}", d.key, d.large), img, egui::TextureOptions::LINEAR)
+                let options = if d.pixelated {
+                    egui::TextureOptions {
+                        magnification: egui::TextureFilter::Nearest,
+                        minification: egui::TextureFilter::Nearest,
+                        ..egui::TextureOptions::default()
+                    }
+                } else {
+                    egui::TextureOptions::LINEAR
+                };
+                ctx.load_texture(format!("icon:{}:{}", d.key, d.large), img, options)
             });
             self.textures.insert((d.key, d.large), tex);
         }
@@ -461,5 +563,43 @@ impl IconCache {
     /// Shell type name for a key ("File folder", "PNG File"), once its icon has been looked up.
     pub fn type_name(&self, key: &str) -> Option<&str> {
         self.type_names.get(key).map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trim_padded_icon() {
+        // Create 256x256 transparent image with 32x32 block in the center (x=112..144, y=112..144)
+        let mut px = vec![0u8; 256 * 256 * 4];
+        for y in 112..144 {
+            for x in 112..144 {
+                let idx = (y * 256 + x) * 4;
+                px[idx] = 255;
+                px[idx + 1] = 255;
+                px[idx + 2] = 255;
+                px[idx + 3] = 255;
+            }
+        }
+        let trimmed = trim_transparent_padding(256, 256, &px);
+        assert_eq!(trimmed, Some((112, 112, 32, 32)));
+
+        let cropped = crop_rgba(256, 256, &px, 112, 112, 32, 32);
+        assert_eq!(cropped.len(), 32 * 32 * 4);
+        assert!(cropped.chunks_exact(4).all(|p| p == [255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn test_center_on_canvas() {
+        let px = vec![255u8; 32 * 32 * 4];
+        let centered = center_on_canvas(32, 32, &px, 96);
+        assert_eq!(centered.len(), 96 * 96 * 4);
+        // Center offset should be (96 - 32) / 2 = 32
+        let sample_center = (48 * 96 + 48) * 4;
+        assert_eq!(&centered[sample_center..sample_center + 4], &[255, 255, 255, 255]);
+        // Top-left corner should be transparent
+        assert_eq!(&centered[0..4], &[0, 0, 0, 0]);
     }
 }
