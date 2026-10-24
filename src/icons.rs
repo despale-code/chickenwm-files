@@ -104,8 +104,8 @@ fn theme_request(key: &str) -> Option<IconRequest> {
 }
 
 fn load_theme_image(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>)> {
-    // Rendered at 16 / 50.4 logical px; keep 256 physical px for high-DPI / icon grid zoom!
-    let side = if large { 256 } else { 32 };
+    // Rendered at 16 / 50.4 logical px; rasterize at 96 / 32 physical px for crisp anti-aliasing.
+    let side = if large { 96 } else { 32 };
     chickenwm_core::icon_theme::load_icon_image(path, side)
 }
 
@@ -145,6 +145,49 @@ fn shell_item_highres(path: &Path, side: i32) -> Option<(usize, usize, Vec<u8>)>
     }
 }
 
+fn ensure_premultiplied(mut px: Vec<u8>) -> Vec<u8> {
+    // If any pixel has RGB > A, then this image was encoded with straight (unmultiplied) alpha.
+    // In that case, premultiply it so it matches Windows Shell & tiny_skia premultiplied alpha.
+    let is_unmultiplied = px.chunks_exact(4).any(|p| {
+        let a = p[3];
+        p[0] > a || p[1] > a || p[2] > a
+    });
+    if is_unmultiplied {
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            p[0] = ((p[0] as u32 * a + 127) / 255) as u8;
+            p[1] = ((p[1] as u32 * a + 127) / 255) as u8;
+            p[2] = ((p[2] as u32 * a + 127) / 255) as u8;
+        }
+    }
+    px
+}
+
+fn downsample_icon_rgba(w: usize, h: usize, px: Vec<u8>, max_side: u32) -> (usize, usize, Vec<u8>) {
+    if (w as u32) <= max_side && (h as u32) <= max_side {
+        return (w, h, px);
+    }
+    if w == 0 || h == 0 || px.len() != w * h * 4 {
+        return (w, h, px);
+    }
+    let (target_w, target_h) = if w >= h {
+        let tw = max_side;
+        let th = ((h as u32 * max_side) / w as u32).max(1);
+        (tw, th)
+    } else {
+        let th = max_side;
+        let tw = ((w as u32 * max_side) / h as u32).max(1);
+        (tw, th)
+    };
+
+    if let Some(src) = image::RgbaImage::from_raw(w as u32, h as u32, px.clone()) {
+        let resized = image::imageops::resize(&src, target_w, target_h, image::imageops::FilterType::Lanczos3);
+        ((target_w as usize), (target_h as usize), resized.into_raw())
+    } else {
+        (w, h, px)
+    }
+}
+
 fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
     let themed = theme_request(key)
         .and_then(|req| theme.resolve(&req))
@@ -153,6 +196,12 @@ fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
     decoded.theme = theme.name.clone();
     if themed.is_some() {
         decoded.rgba = themed;
+    }
+    if let Some((w, h, px)) = decoded.rgba {
+        let max_side = if large { 96 } else { 32 };
+        let premul_px = ensure_premultiplied(px);
+        let (dw, dh, dpx) = downsample_icon_rgba(w, h, premul_px, max_side);
+        decoded.rgba = Some((dw, dh, dpx));
     }
     decoded
 }
@@ -389,7 +438,7 @@ impl IconCache {
                 self.type_names.insert(d.key.clone(), name);
             }
             let tex = d.rgba.map(|(w, h, px)| {
-                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
+                let img = egui::ColorImage::from_rgba_premultiplied([w, h], &px);
                 ctx.load_texture(format!("icon:{}:{}", d.key, d.large), img, egui::TextureOptions::LINEAR)
             });
             self.textures.insert((d.key, d.large), tex);
