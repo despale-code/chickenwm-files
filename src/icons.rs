@@ -14,16 +14,23 @@ use std::mem::size_of;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use windows::core::HSTRING;
+use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::UI::Controls::IImageList;
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
+    IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, SHGetImageList,
+    SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
+    SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, HICON, ICONINFO};
+
+const SHIL_EXTRALARGE: i32 = 2; // 48x48
+const SHIL_JUMBO: i32 = 4; // 256x256
+const ILD_TRANSPARENT: u32 = 1;
 
 /// Icon lookup key: `dir`, `ext:.png`, or `path:C:\...` for items with their own icon.
 pub fn icon_key(path: &Path, is_dir: bool) -> String {
@@ -97,9 +104,45 @@ fn theme_request(key: &str) -> Option<IconRequest> {
 }
 
 fn load_theme_image(path: &Path, large: bool) -> Option<(usize, usize, Vec<u8>)> {
-    // Rendered at 16 / 40 logical px; keep 2x for high-DPI.
-    let side = if large { 80 } else { 32 };
+    // Rendered at 16 / 50.4 logical px; keep 256 physical px for high-DPI / icon grid zoom!
+    let side = if large { 256 } else { 32 };
     chickenwm_core::icon_theme::load_icon_image(path, side)
+}
+
+fn get_image_list_icon(index: i32, size_code: i32) -> Option<HICON> {
+    unsafe {
+        let iml: windows::core::Result<IImageList> = SHGetImageList(size_code);
+        if let Ok(list) = iml {
+            if let Ok(hicon) = list.GetIcon(index, ILD_TRANSPARENT) {
+                if !hicon.is_invalid() {
+                    return Some(hicon);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn shell_item_highres(path: &Path, side: i32) -> Option<(usize, usize, Vec<u8>)> {
+    let path_str = path.to_string_lossy();
+    let wide = HSTRING::from(path_str.as_ref());
+    unsafe {
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&wide, None).ok()?;
+        let size = SIZE { cx: side, cy: side };
+        let hbmp = factory.GetImage(size, SIIGBF_RESIZETOFIT).ok()?;
+        let rgba = read_bitmap_bgra(hbmp, side, side);
+        let _ = DeleteObject(hbmp);
+        let mut px = rgba?;
+        if px.chunks_exact(4).all(|p| p[3] == 0) {
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+        }
+        for p in px.chunks_exact_mut(4) {
+            p.swap(0, 2); // BGRA -> RGBA
+        }
+        Some((side as usize, side as usize, px))
+    }
 }
 
 fn lookup(key: &str, large: bool, theme: &IconTheme) -> Decoded {
@@ -123,7 +166,45 @@ fn shell_lookup(key: &str, large: bool, name_only: bool) -> Decoded {
     } else {
         (key.trim_start_matches("path:").to_string(), FILE_ATTRIBUTE_NORMAL, false)
     };
-    let mut flags: SHGFI_FLAGS = if name_only { SHGFI_TYPENAME } else { SHGFI_ICON | SHGFI_TYPENAME };
+
+    // If a large icon is requested for a real path on disk, extract high-res (256x256) via IShellItemImageFactory
+    if large && !name_only && !use_attrs {
+        let p = Path::new(&target);
+        if p.exists() {
+            if let Some(rgba) = shell_item_highres(p, 256) {
+                let mut sfi = SHFILEINFOW::default();
+                let type_name = unsafe {
+                    let res = SHGetFileInfoW(
+                        &HSTRING::from(&target),
+                        attrs,
+                        Some(&mut sfi),
+                        size_of::<SHFILEINFOW>() as u32,
+                        SHGFI_TYPENAME,
+                    );
+                    if res != 0 {
+                        let len = sfi.szTypeName.iter().position(|&c| c == 0).unwrap_or(0);
+                        let name = String::from_utf16_lossy(&sfi.szTypeName[..len]);
+                        (!name.is_empty()).then_some(name)
+                    } else {
+                        None
+                    }
+                };
+                return Decoded {
+                    key: key.to_string(),
+                    large,
+                    rgba: Some(rgba),
+                    type_name,
+                    theme: String::new(),
+                };
+            }
+        }
+    }
+
+    let mut flags: SHGFI_FLAGS = if name_only {
+        SHGFI_TYPENAME
+    } else {
+        SHGFI_ICON | SHGFI_TYPENAME | SHGFI_SYSICONINDEX
+    };
     flags |= if large { SHGFI_LARGEICON } else { SHGFI_SMALLICON };
     if use_attrs {
         flags |= SHGFI_USEFILEATTRIBUTES;
@@ -131,7 +212,7 @@ fn shell_lookup(key: &str, large: bool, name_only: bool) -> Decoded {
     let mut sfi = SHFILEINFOW::default();
     let (rgba, type_name) = unsafe {
         let res = SHGetFileInfoW(
-            &HSTRING::from(target),
+            &HSTRING::from(&target),
             attrs,
             Some(&mut sfi),
             size_of::<SHFILEINFOW>() as u32,
@@ -140,11 +221,26 @@ fn shell_lookup(key: &str, large: bool, name_only: bool) -> Decoded {
         if res == 0 {
             (None, None)
         } else {
-            let rgba = if sfi.hIcon.is_invalid() {
+            let rgba = if name_only {
                 None
-            } else {
+            } else if large {
+                // Try Jumbo (256x256), then ExtraLarge (48x48) from system image list
+                let high_res_icon = get_image_list_icon(sfi.iIcon, SHIL_JUMBO)
+                    .or_else(|| get_image_list_icon(sfi.iIcon, SHIL_EXTRALARGE));
+                if let Some(hicon) = high_res_icon {
+                    let _guard = SafeHicon::new(hicon);
+                    hicon_to_rgba(hicon)
+                } else if !sfi.hIcon.is_invalid() {
+                    let _guard = SafeHicon::new(sfi.hIcon);
+                    hicon_to_rgba(sfi.hIcon)
+                } else {
+                    None
+                }
+            } else if !sfi.hIcon.is_invalid() {
                 let _guard = SafeHicon::new(sfi.hIcon);
                 hicon_to_rgba(sfi.hIcon)
+            } else {
+                None
             };
             let len = sfi.szTypeName.iter().position(|&c| c == 0).unwrap_or(0);
             let name = String::from_utf16_lossy(&sfi.szTypeName[..len]);
